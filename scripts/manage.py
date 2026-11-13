@@ -20,6 +20,7 @@ def app_env() -> dict[str, str]:
     env.update({
         "PYTHONPATH": os.pathsep.join(str(ROOT / p) for p in ("services/api", "services/worker", "packages/domain-python")),
         "PYTHONDONTWRITEBYTECODE": "1", "APP_ENV": "local", "DISPATCH_ENABLED": "false",
+        "KAJH_PROJECT": values["KAJH_PROJECT"],
         "DATABASE_URL": f"postgresql+psycopg://kajh_api:{values['KAJH_API_PASSWORD']}@127.0.0.1:55439/kajh_dev",
         "DATABASE_ADMIN_URL": f"postgresql+psycopg://postgres:{values['KAJH_DB_PASSWORD']}@127.0.0.1:55439/kajh_dev",
         "WORKER_DATABASE_URL": f"postgresql+psycopg://kajh_worker:{values['KAJH_WORKER_PASSWORD']}@127.0.0.1:55439/kajh_dev",
@@ -47,6 +48,16 @@ def run(*args: str, **kwargs):
     return subprocess.run(args, cwd=ROOT, env=app_env(), check=True, **kwargs)
 
 
+def web_env() -> dict[str, str]:
+    """The frontend proxy needs no database, JWT, account or provider secrets."""
+    allowed = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "TZ", "SHELL")
+    env = {key: os.environ[key] for key in allowed if key in os.environ}
+    env.update({"API_BASE_URL": "http://127.0.0.1:8210", "KAJH_API_URL": "http://127.0.0.1:8210",
+                "NEXT_TELEMETRY_DISABLED": "1", "npm_config_update_notifier": "false",
+                "npm_config_cache": str(ROOT / "apps/web/.cache/npm")})
+    return env
+
+
 def process_signature(pid: int) -> str:
     result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=", "-o", "command="], capture_output=True, text=True)
     return result.stdout.strip()
@@ -64,7 +75,7 @@ def web_start() -> None:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 3210))
     log = (LOCAL / "logs/web.log").open("a")
-    proc = subprocess.Popen(["npm", "run", "dev"], cwd=ROOT / "apps/web", env=app_env(),
+    proc = subprocess.Popen(["npm", "run", "dev"], cwd=ROOT / "apps/web", env=web_env(),
                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     log.close()
     time.sleep(0.3)

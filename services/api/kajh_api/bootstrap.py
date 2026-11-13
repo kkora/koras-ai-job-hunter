@@ -19,6 +19,8 @@ from .models import Job, Membership, ProfileVersion, SearchProfile, Source, Sour
 ROOT = Path(__file__).resolve().parents[3]
 WORKSPACE = UUID("00000000-0000-0000-0000-000000000001")
 ISOLATION_WORKSPACE = UUID("00000000-0000-0000-0000-000000000002")
+FROZEN_INITIAL_CHECKSUM = "2bb69190157acce74acb8846fcc97b3e57212eab88b1784c4d7537f3d4ea6e23"
+LEGACY_INITIAL_CHECKSUM = "0d2e26fe88bbcb545e709350f3b2f9b43635c2714ea836838c99d66ffbae022c"
 
 
 def admin_engine():
@@ -26,15 +28,29 @@ def admin_engine():
     url = make_url(value)
     if url.username != "postgres" or url.database != "kajh_dev" or url.host not in {"db", "restore-db", "127.0.0.1", "localhost"}:
         raise RuntimeError("Refusing nonlocal administrative migration target")
-    return create_engine(value, hide_parameters=True)
+    expected_project = os.environ.get("KAJH_PROJECT", "")
+    if not expected_project.startswith("kajh-p1-"):
+        raise RuntimeError("Refusing administrative target without the owned project prefix")
+    engine = create_engine(value, hide_parameters=True)
+    try:
+        with engine.connect() as connection:
+            cluster: str = connection.execute(text("SELECT current_setting('cluster_name')")).scalar_one()
+        if cluster != expected_project:
+            raise RuntimeError("Refusing administrative target with a different cluster owner")
+    except Exception:
+        engine.dispose()
+        raise
+    return engine
 
 
 def migrate():
     engine = admin_engine()
     policies = ROOT / "database/migrations/001_policies.sql"
     schema = ROOT / "database/migrations/001_schema.sql"
-    checksum = hashlib.sha256(policies.read_bytes() + schema.read_bytes()).hexdigest()
-    legacy_checksum = "0d2e26fe88bbcb545e709350f3b2f9b43635c2714ea836838c99d66ffbae022c"
+    policy_bytes, schema_bytes = policies.read_bytes(), schema.read_bytes()
+    checksum = hashlib.sha256(policy_bytes + schema_bytes).hexdigest()
+    if checksum != FROZEN_INITIAL_CHECKSUM:
+        raise RuntimeError("Frozen migration 001 source checksum changed; add a new numbered migration")
     with engine.begin() as connection:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         connection.execute(text("CREATE SCHEMA IF NOT EXISTS app AUTHORIZATION kajh_owner"))
@@ -42,14 +58,14 @@ def migrate():
         connection.execute(text("CREATE TABLE IF NOT EXISTS app.schema_migrations(version text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())"))
         existing = connection.execute(text("SELECT checksum FROM app.schema_migrations WHERE version='001_initial'" )).scalar_one_or_none()
         if existing:
-            if existing not in {checksum, legacy_checksum}:
+            if existing not in {FROZEN_INITIAL_CHECKSUM, LEGACY_INITIAL_CHECKSUM}:
                 raise RuntimeError("Migration 001 checksum changed; add a new migration or reset only owned disposable development data")
             print(json.dumps({"migration": "001_initial", "status": "already_applied"}))
         else:
             connection.execute(text("SET LOCAL ROLE kajh_owner"))
-            connection.exec_driver_sql(schema.read_text(), execution_options={"no_parameters": True})
+            connection.exec_driver_sql(schema_bytes.decode(), execution_options={"no_parameters": True})
             connection.execute(text("RESET ROLE"))
-            connection.exec_driver_sql(policies.read_text(), execution_options={"no_parameters": True})
+            connection.exec_driver_sql(policy_bytes.decode(), execution_options={"no_parameters": True})
             connection.execute(text("INSERT INTO app.schema_migrations(version,checksum) VALUES ('001_initial',:checksum)"), {"checksum": checksum})
             print(json.dumps({"migration": "001_initial", "status": "applied", "checksum": checksum}))
         for path in sorted((ROOT / "database/migrations").glob("[0-9][0-9][0-9]_*.sql")):

@@ -38,9 +38,37 @@ def docker(*args: str, check: bool = True, **kwargs):
 
 def compose(*args: str, check: bool = True, **kwargs):
     env = load_env()
+    preflight_ownership()
     return docker("compose", "--project-name", env["KAJH_PROJECT"], "--project-directory", str(ROOT),
                   "--env-file", str(LOCAL / "env"), "--file", str(ROOT / "infrastructure/local/compose.yml"),
                   *args, check=check, **kwargs)
+
+
+def preflight_ownership() -> None:
+    """Refuse existing name collisions before Compose can adopt or recreate them."""
+    project = load_env()["KAJH_PROJECT"]
+    resources = {
+        "container": ("db", "api", "worker", "auth", "mail", "gateway", "restore-db", "restore-gateway"),
+        "network": ("private", "ingress", "restore", "restore-ingress"),
+        "volume": ("pgdata", "restoredata"),
+    }
+    for kind, suffixes in resources.items():
+        for suffix in suffixes:
+            result = docker(kind, "inspect", project+"-"+suffix, check=False, capture_output=True, text=True)
+            if result.returncode:
+                if not is_missing_resource(kind,project+"-"+suffix,result.stderr):
+                    raise RuntimeError("Docker ownership preflight failed; no mutation attempted")
+                continue
+            item = json.loads(result.stdout)[0]
+            labels = (item.get("Config", {}).get("Labels") if kind == "container" else item.get("Labels")) or {}
+            if labels.get("io.koras.kajh.project") != project:
+                raise RuntimeError(f"Refusing unrecognized {kind} name collision")
+
+
+def is_missing_resource(kind: str, name: str, message: str) -> bool:
+    error=message.lower()
+    return (f"no such {kind}" in error or "no such object" in error
+            or (kind=="network" and f"network {name} not found" in error))
 
 
 def assert_owned(kind: str, name: str) -> None:
