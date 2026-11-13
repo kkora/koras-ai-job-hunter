@@ -1,6 +1,6 @@
 # Koras AI Job Hunter — local P1
 
-Private, synthetic-only B2B opportunity discovery for Koras Technologies LLC. Authorized by **KAJH-P1-AUTH-001**, following the conditionally accepted **KAJH-OWN-001** architecture. This is a local development application; P1 acceptance awaits owner review.
+Private, synthetic-only B2B opportunity discovery for Koras Technologies LLC. Authorized by **KAJH-P1-AUTH-001**, following the conditionally accepted **KAJH-OWN-001** architecture. The owner accepted P1 for bounded local synthetic-only use under [KAJH-OWN-002](docs/decisions/KAJH-OWN-002-P1-ACCEPTANCE.md). E-09 is QUALIFIED CLOSED for the demonstrated local runtime, with its exclusions retained; E-02 remains OPEN and all real sources disabled. P2 and production use are not authorized.
 
 ## Open the application
 

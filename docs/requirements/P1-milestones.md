@@ -1,6 +1,6 @@
 # P1 milestone ledger
 
-Authorization: **KAJH-P1-AUTH-001**. Date: November 13, 2026. Commits are local only. This ledger records implementation evidence, not owner acceptance.
+Authorization: **KAJH-P1-AUTH-001**. Date: November 13, 2026. Commits are local only. This ledger retains the implementation evidence. Owner acceptance is recorded separately in [KAJH-OWN-002](../decisions/KAJH-OWN-002-P1-ACCEPTANCE.md): **P1 ACCEPTED — LOCAL SYNTHETIC ONLY; E-09 QUALIFIED CLOSED with exclusions retained; E-02 OPEN; P2 NOT AUTHORIZED**. The decision adds no new test results and does not rewrite historical P0 acceptance.
 
 | Milestone | Implemented files and behavior | Verification | Result / remaining risk |
 |---|---|---|---|

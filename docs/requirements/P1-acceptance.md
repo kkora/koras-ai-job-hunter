@@ -2,6 +2,8 @@
 
 Date: November 13, 2026. Repository: `/Users/kan/Projects/koras-ai-job-hunter`. Authorization: **KAJH-P1-AUTH-001**. Architecture baseline: **KAJH-OWN-001**. All data is synthetic; all Git history is local.
 
+Owner decision [KAJH-OWN-002](../decisions/KAJH-OWN-002-P1-ACCEPTANCE.md), dated November 13, 2026: **P1 ACCEPTED — LOCAL SYNTHETIC ONLY**. **E-09 QUALIFIED CLOSED** for the demonstrated local P1 runtime, with mandatory exclusions retained as NOT VERIFIED in the [exception register](../decisions/KAJH-OWN-002-P1-ACCEPTANCE.md#exception-register) and [exclusion table](../decisions/KAJH-OWN-002-P1-ACCEPTANCE.md#e-09-mandatory-exclusions-and-future-gates). **E-02 remains OPEN**, real sources remain disabled, and **P2 is NOT AUTHORIZED**. This documentation disposition changes no recorded test result.
+
 **IMPLEMENTED** means working source exists. **TESTED** means an automated check executed. **VERIFIED** means the described local runtime behavior was observed. **BLOCKED** denotes an unmet external prerequisite. **DEFERRED** denotes later-phase capability. Neither technical evidence nor this report substitutes for owner acceptance.
 
 ## P1 coverage
@@ -47,7 +49,7 @@ The suites exercise database constraints and role escalation negatives, forged/e
 
 ## E-09 bounded local evidence
 
-The historical P0 result is preserved. KAJH-P1-AUTH-001 separately authorized these stateful tests; their actual evidence is new P1 evidence.
+The historical P0 result is preserved. KAJH-P1-AUTH-001 separately authorized these stateful tests; their actual evidence is new P1 evidence. KAJH-OWN-002 accepts qualified closure only for the demonstrated local runtime. The observations below do not mark the excluded checks PASS; in particular, saved outage evidence predates the final image and does not establish comprehensive final-image outage coverage.
 
 | Area | Observed result and private evidence | Status |
 |---|---|---|
@@ -88,8 +90,8 @@ Historical total: **10 PASS, 1 BLOCKED, 1 NOT VERIFIED**. P0 architecture remain
 
 | Decision | Owner action / evidence required | Current state |
 |---|---|---|
-| Accept bounded local P1 | Review this implementation, tests and documented limits; accept the synthetic-only scope | PENDING OWNER REVIEW |
-| E-09 exception disposition | Review actual bounded runtime evidence and decide whether to close/qualify E-09 | Technically verified within documented limits; owner disposition pending |
+| Accept bounded local P1 | Owner decision KAJH-OWN-002 accepts the implementation and documented limits | ACCEPTED — LOCAL SYNTHETIC ONLY |
+| E-09 exception disposition | KAJH-OWN-002 qualifies closure for the demonstrated local runtime; six mandatory exclusions retain NOT VERIFIED status and future gates in the linked exception register | QUALIFIED CLOSED — EXCLUSIONS RETAINED |
 | E-02 source entitlement | For each candidate obtain and accept evidence for commercial discovery, automated collection, private display, external AI, embeddings, persistent/evidence retention, backups/checkpoints, attribution, quotas, pricing and deletion/revocation | OPEN / BLOCKING every real source |
 | Koras business facts | Supply verified legal/vendor qualifications, registrations, certifications, delivery constraints and commercial terms before real operational use | Synthetic defaults only |
 | Future phase or deployment | Separately authorize P2, real-source activation after third-party rights, cloud/paid services or external business actions | NOT AUTHORIZED by P1 |
@@ -104,6 +106,6 @@ Remote OK, Lever, Greenhouse and Ashby remain candidate interfaces only. Remotiv
 | M2 security/domain | `b5634d1` |
 | M3 ingestion/checkpoints | `e6f0ead` |
 | M4 dashboard/workflows | `7759cc9` |
-| M5 hardening/evidence | Recorded in final conversation and local Git log after validation |
+| M5 hardening/evidence | `9211ae4` |
 
-Recommendation: accept local synthetic P1 after owner review with E-02 and the stated production/later-phase limits retained. Do not activate sources or infer P2/cloud/outbound authorization from P1 acceptance.
+Final owner decision: KAJH-OWN-002 accepts local synthetic-only P1 and qualified E-09 closure with all exclusions retained. E-02 remains OPEN and source activation BLOCKED. Historical P0 results and all future authorization gates remain unchanged. P1 acceptance does not authorize P2, source activation, cloud deployment, paid services, external business actions or production use.
