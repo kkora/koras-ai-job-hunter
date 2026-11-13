@@ -1,0 +1,49 @@
+[project]
+name = "koras-ai-job-hunter"
+version = "0.1.0"
+description = "Private synthetic-first Koras consulting opportunity workspace"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.162.7",
+  "pydantic-settings==2.16.3",
+  "sqlalchemy==2.1.8",
+  "psycopg[binary]==3.3.9",
+  "PyJWT==2.15.1",
+  "httpx==0.28.1",
+  "opentelemetry-api==1.45.2",
+  "langgraph==1.2.21",
+  "langgraph-checkpoint-postgres==3.2.0",
+  "uvicorn>=0.35,<1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==9.2.0",
+  "pytest-asyncio>=1.2,<2",
+  "ruff==0.17.5",
+  "mypy>=1.15,<2",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["services/api", "services/worker", "packages/domain-python"]
+addopts = "-ra"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["integration: requires the owned local runtime", "e09: local runtime validation"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+exclude = [".local", ".venv", "apps/web/node_modules", "apps/web/.next"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+check_untyped_defs = true
+exclude = [".local", ".venv", "apps"]

@@ -1,0 +1,247 @@
+name: ${KAJH_PROJECT}
+x-owned: &owned
+  platform: linux/arm64
+  restart: "no"
+  init: true
+  privileged: false
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 128
+  labels:
+    io.koras.kajh.project: ${KAJH_PROJECT}
+  logging:
+    driver: local
+    options:
+      max-size: "5m"
+      max-file: "2"
+
+x-python: &python
+  <<: *owned
+  image: ${KAJH_PROJECT}-python:local
+  build:
+    context: .
+    dockerfile: infrastructure/local/Dockerfile
+    args:
+      PYTHON_IMAGE: ${KAJH_PYTHON_IMAGE}
+  read_only: true
+  cap_drop: [ALL]
+  tmpfs: ["/tmp:rw,nosuid,nodev,size=128m,mode=1777"]
+  networks: [private]
+
+services:
+  db:
+    <<: *owned
+    container_name: ${KAJH_PROJECT}-db
+    image: ${KAJH_POSTGRES_IMAGE}
+    cpus: 2
+    mem_limit: 2g
+    shm_size: 512m
+    stop_grace_period: 30s
+    command: ["postgres", "-c", "cluster_name=${KAJH_PROJECT}", "-c", "shared_buffers=256MB", "-c", "work_mem=8MB", "-c", "maintenance_work_mem=256MB", "-c", "max_connections=60", "-c", "password_encryption=scram-sha-256"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: kajh_dev
+      POSTGRES_PASSWORD: ${KAJH_DB_PASSWORD}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      KAJH_API_PASSWORD: ${KAJH_API_PASSWORD}
+      KAJH_WORKER_PASSWORD: ${KAJH_WORKER_PASSWORD}
+      KAJH_AUTH_PASSWORD: ${KAJH_AUTH_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [private]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d kajh_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  mail:
+    <<: *owned
+    container_name: ${KAJH_PROJECT}-mail
+    image: ${KAJH_MAIL_IMAGE}
+    cpus: 0.25
+    mem_limit: 128m
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: ["/tmp:rw,nosuid,nodev,size=64m,mode=1777"]
+    environment:
+      MP_DATABASE: /tmp/kajh-mail.db
+      MP_MAX_MESSAGES: "50"
+    networks: [private]
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8025/readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  auth:
+    <<: *owned
+    container_name: ${KAJH_PROJECT}-auth
+    image: ${KAJH_AUTH_IMAGE}
+    cpus: 0.5
+    mem_limit: 512m
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: ["/tmp:rw,nosuid,nodev,size=64m,mode=1777"]
+    depends_on:
+      db: {condition: service_healthy}
+      mail: {condition: service_healthy}
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: "9999"
+      API_EXTERNAL_URL: http://127.0.0.1:${KAJH_AUTH_PORT}
+      GOTRUE_SITE_URL: http://127.0.0.1:${KAJH_WEB_PORT}
+      GOTRUE_URI_ALLOW_LIST: ""
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://kajh_auth_admin:${KAJH_AUTH_PASSWORD}@db:5432/kajh_dev?sslmode=disable
+      GOTRUE_JWT_SECRET: ${KAJH_JWT_SECRET}
+      GOTRUE_JWT_ISSUER: http://127.0.0.1:${KAJH_AUTH_PORT}
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_EXP: "3600"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_SMTP_HOST: mail
+      GOTRUE_SMTP_PORT: "1025"
+      GOTRUE_SMTP_ADMIN_EMAIL: noreply@kajh.invalid
+      GOTRUE_SMTP_SENDER_NAME: Koras synthetic local test
+    networks: [private]
+    healthcheck:
+      test: [CMD, wget, --no-verbose, --tries=1, --spider, "http://127.0.0.1:9999/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  api:
+    <<: *python
+    container_name: ${KAJH_PROJECT}-api
+    cpus: 1
+    mem_limit: 1g
+    depends_on:
+      db: {condition: service_healthy}
+      auth: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgresql+psycopg://kajh_api:${KAJH_API_PASSWORD}@db:5432/kajh_dev
+      AUTH_URL: http://auth:9999
+      AUTH_JWT_SECRET: ${KAJH_JWT_SECRET}
+      AUTH_ISSUER: http://127.0.0.1:${KAJH_AUTH_PORT}
+      WEB_ORIGINS: http://127.0.0.1:${KAJH_WEB_PORT},http://localhost:${KAJH_WEB_PORT}
+      APP_ENV: local
+      DISPATCH_ENABLED: "false"
+      LANGSMITH_TRACING: "false"
+      LANGCHAIN_TRACING_V2: "false"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    <<: *python
+    container_name: ${KAJH_PROJECT}-worker
+    cpus: 1
+    mem_limit: 1g
+    depends_on:
+      db: {condition: service_healthy}
+    command: [python, -m, kajh_worker.main]
+    environment:
+      WORKER_DATABASE_URL: postgresql+psycopg://kajh_worker:${KAJH_WORKER_PASSWORD}@db:5432/kajh_dev
+      CHECKPOINT_DATABASE_URL: postgresql://kajh_worker:${KAJH_WORKER_PASSWORD}@db:5432/kajh_dev
+      DISPATCH_ENABLED: "false"
+      LANGGRAPH_STRICT_MSGPACK: "true"
+      LANGSMITH_TRACING: "false"
+      LANGCHAIN_TRACING_V2: "false"
+
+  gateway:
+    <<: *owned
+    container_name: ${KAJH_PROJECT}-gateway
+    image: ${KAJH_PYTHON_IMAGE}
+    cpus: 0.25
+    mem_limit: 128m
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    command: [python, -B, /opt/kajh-gateway.py]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./infrastructure/local/gateway.py:/opt/kajh-gateway.py:ro
+    ports:
+      - "127.0.0.1:${KAJH_DB_PORT}:55439"
+      - "127.0.0.1:${KAJH_API_PORT}:8210"
+      - "127.0.0.1:${KAJH_AUTH_PORT}:59999"
+      - "127.0.0.1:${KAJH_MAIL_PORT}:58029"
+    networks: [private, ingress]
+
+  restore-db:
+    <<: *owned
+    profiles: [restore]
+    container_name: ${KAJH_PROJECT}-restore-db
+    image: ${KAJH_POSTGRES_IMAGE}
+    cpus: 1
+    mem_limit: 2g
+    command: ["postgres", "-c", "cluster_name=${KAJH_PROJECT}-restore"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: kajh_dev
+      POSTGRES_PASSWORD: ${KAJH_DB_PASSWORD}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      KAJH_API_PASSWORD: ${KAJH_API_PASSWORD}
+      KAJH_WORKER_PASSWORD: ${KAJH_WORKER_PASSWORD}
+      KAJH_AUTH_PASSWORD: ${KAJH_AUTH_PASSWORD}
+    volumes:
+      - restoredata:/var/lib/postgresql/data
+    networks: [restore]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d kajh_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  restore-gateway:
+    <<: *owned
+    profiles: [restore]
+    container_name: ${KAJH_PROJECT}-restore-gateway
+    image: ${KAJH_PYTHON_IMAGE}
+    cpus: 0.25
+    mem_limit: 128m
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    command: [python, -B, /opt/kajh-gateway.py]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      KAJH_GATEWAY_MODE: restore
+    volumes:
+      - ./infrastructure/local/gateway.py:/opt/kajh-gateway.py:ro
+    ports: ["127.0.0.1:55440:55440"]
+    networks: [restore, restore_ingress]
+
+networks:
+  restore_ingress:
+    name: ${KAJH_PROJECT}-restore-ingress
+    labels: {io.koras.kajh.project: "${KAJH_PROJECT}"}
+  ingress:
+    name: ${KAJH_PROJECT}-ingress
+    labels: {io.koras.kajh.project: "${KAJH_PROJECT}"}
+  private:
+    name: ${KAJH_PROJECT}-private
+    internal: true
+    labels: {io.koras.kajh.project: "${KAJH_PROJECT}"}
+  restore:
+    name: ${KAJH_PROJECT}-restore
+    internal: true
+    labels: {io.koras.kajh.project: "${KAJH_PROJECT}"}
+
+volumes:
+  pgdata:
+    name: ${KAJH_PROJECT}-pgdata
+    labels: {io.koras.kajh.project: "${KAJH_PROJECT}"}
+  restoredata:
+    name: ${KAJH_PROJECT}-restoredata
+    labels: {io.koras.kajh.project: "${KAJH_PROJECT}"}

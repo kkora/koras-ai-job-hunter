@@ -1,0 +1,22 @@
+{
+  "auth": {
+    "candidate": "supabase/gotrue:v2.197.0",
+    "platform": "linux/arm64",
+    "reference": "supabase/gotrue@sha256:3439d5affb9e96395d1348521f4c675eea7096d8d76d18d4e31fcc08df802116"
+  },
+  "mail": {
+    "candidate": "axllent/mailpit:v1.27.4",
+    "platform": "linux/arm64",
+    "reference": "axllent/mailpit@sha256:607decfcecf190ea2e7f75c0650f515b929e7ed0c785ccddc7ae7589c0ecb2c3"
+  },
+  "postgres": {
+    "candidate": "pgvector/pgvector:0.8.7-pg17",
+    "platform": "linux/arm64",
+    "reference": "pgvector/pgvector@sha256:8863731f8ef4e6d1c38f279ece767fba693ae7bb3adac60492b7f390299d07f4"
+  },
+  "python": {
+    "candidate": "python:3.12.10-slim-bookworm",
+    "platform": "linux/arm64",
+    "reference": "python@sha256:79082fdf411b897d64983893f44e8e1908e21cade2fc5a794d4f46de76c85275"
+  }
+}

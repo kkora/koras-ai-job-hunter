@@ -1,0 +1,11 @@
+.git
+.local
+.cache
+.venv
+**/__pycache__
+**/node_modules
+**/.next
+apps
+tests
+docs
+*.log
