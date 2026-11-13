@@ -19,6 +19,7 @@ export class ApiError extends Error {
 
 let csrf = "";
 export function setCsrf(value: string) { csrf = value; }
+export const SESSION_EXPIRED_EVENT = "kajh:session-expired";
 
 function cookieCsrf(): string {
   if (typeof document === "undefined") return "";
@@ -38,6 +39,7 @@ export async function api<T>(path: string, options: { method?: string; body?: un
   const response = await fetch(`/api/v1${path}`, { method, headers, credentials: "same-origin", cache: "no-store", body: options.body === undefined ? undefined : JSON.stringify(options.body), signal: options.signal });
   const result = response.status === 204 ? null : await response.json().catch(() => null);
   if (!response.ok) {
+    if (response.status === 401 && path !== "/auth/login" && typeof window !== "undefined") window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
     const error = result?.error;
     throw new ApiError(response.status, error?.code ?? "REQUEST_FAILED", error?.message ?? "The request could not be completed.", error?.request_id);
   }

@@ -17,15 +17,16 @@ from opentelemetry import trace
 from sqlalchemy import String, func, select, text, literal_column, exists, or_
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException
 
-from kajh_domain import evaluate_eligibility
+from kajh_domain import POLICY_VERSION, canonical_hash, dedupe_key, evaluate_eligibility, vendor_hash
 
 from .auth import Identity, csrf_token, database, identity, identity_payload, require_owner, require_write, resolve_identity
 from .config import settings
 from .db import engine
 from .errors import APIError
-from .models import AuditEvent, EligibilityEvidence, IdempotencyKey, Job, Opportunity, OpportunitySource, ProfileVersion, RawObservation, SavedOpportunity, SearchProfile, Source, SourcePermission, SourceRun, VendorProfile, WorkflowDecision, WorkflowRun, utcnow
-from .schemas import Login, ResumeInput, ReviewInput, SavedInput, SearchInput, SearchUpdate, SourceUpdate, SplitSourceInput, VendorInput, bounded_object
+from .models import AuditEvent, EligibilityEvidence, IdempotencyKey, Job, Opportunity, OpportunitySource, ProfileVersion, RawObservation, SavedOpportunity, SearchProfile, Source, SourcePermission, SourceRun, VendorProfile, WorkflowDecision, WorkflowRun, strict_json_equal, utcnow
+from .schemas import Login, ResumeInput, ReviewInput, SavedInput, SearchInput, SearchUpdate, SourceUpdate, SplitSourceInput, UnmergeInput, VendorInput, bounded_object
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,6 +47,15 @@ tracer = trace.get_tracer("kajh.api")
 STATUSES = {"Eligible", "Ineligible", "Unknown", "Needs Review"}
 
 
+def boundary_response(request: Request, response: Response, started: float) -> Response:
+    response.headers["X-Request-ID"] = request.state.request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    log.info(json.dumps({"event": "http_request", "request_id": request.state.request_id, "method": request.method, "path": request.url.path, "status": response.status_code, "duration_ms": round((time.monotonic() - started) * 1000, 2)}))
+    return response
+
+
 @app.middleware("http")
 async def request_boundary(request: Request, call_next):
     request.state.request_id = str(uuid4())
@@ -53,24 +63,19 @@ async def request_boundary(request: Request, call_next):
     try:
         declared_length = int(request.headers.get("content-length", "0") or 0)
     except ValueError:
-        return JSONResponse({"error": {"code": "INVALID_CONTENT_LENGTH", "message": "Invalid request length.", "request_id": request.state.request_id}}, 400)
+        return boundary_response(request, JSONResponse({"error": {"code": "INVALID_CONTENT_LENGTH", "message": "Invalid request length.", "request_id": request.state.request_id}}, 400), started)
     if declared_length < 0 or declared_length > 1_048_576:
-        return JSONResponse({"error": {"code": "PAYLOAD_TOO_LARGE", "message": "Request exceeds 1 MB.", "request_id": request.state.request_id}}, 413)
+        return boundary_response(request, JSONResponse({"error": {"code": "PAYLOAD_TOO_LARGE", "message": "Request exceeds 1 MB.", "request_id": request.state.request_id}}, 413), started)
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         body = bytearray()
         async for chunk in request.stream():
             if len(body) + len(chunk) > 1_048_576:
-                return JSONResponse({"error": {"code": "PAYLOAD_TOO_LARGE", "message": "Request exceeds 1 MB.", "request_id": request.state.request_id}}, 413)
+                return boundary_response(request, JSONResponse({"error": {"code": "PAYLOAD_TOO_LARGE", "message": "Request exceeds 1 MB.", "request_id": request.state.request_id}}, 413), started)
             body.extend(chunk)
         request._body = bytes(body)
     with tracer.start_as_current_span(f"{request.method} {request.url.path}"):
         response = await call_next(request)
-    response.headers["X-Request-ID"] = request.state.request_id
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
-    log.info(json.dumps({"event": "http_request", "request_id": request.state.request_id, "method": request.method, "path": request.url.path, "status": response.status_code, "duration_ms": round((time.monotonic() - started) * 1000, 2)}))
-    return response
+    return boundary_response(request, response, started)
 
 
 @app.exception_handler(APIError)
@@ -81,6 +86,12 @@ async def api_error(request: Request, error: APIError):
 @app.exception_handler(RequestValidationError)
 async def invalid_request(request: Request, error: RequestValidationError):
     return JSONResponse({"error": {"code": "VALIDATION_ERROR", "message": "Some fields are invalid.", "request_id": getattr(request.state, "request_id", None), "details": [{"field": ".".join(map(str, e["loc"])), "message": e["msg"], "type": e["type"]} for e in error.errors()]}}, 422)
+
+
+@app.exception_handler(HTTPException)
+async def http_error(request: Request, error: HTTPException):
+    code = "NOT_FOUND" if error.status_code == 404 else "METHOD_NOT_ALLOWED" if error.status_code == 405 else "HTTP_ERROR"
+    return JSONResponse({"error": {"code": code, "message": "The requested endpoint is unavailable.", "request_id": getattr(request.state, "request_id", None)}}, error.status_code, headers=error.headers)
 
 
 @app.exception_handler(ValueError)
@@ -124,12 +135,31 @@ def idem_start(db: Session, person: Identity, scope: str, key: str | None, body:
     if not key or not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", key):
         raise APIError(422, "IDEMPOTENCY_REQUIRED", "Provide an 8–160 character Idempotency-Key.")
     digest = hashlib.sha256(json.dumps(body, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+    # Serialize retries before reading either the replay or a resource version.
+    # The lock lasts until the business mutation and replay record commit together.
+    write_lock(db, person, "idempotency", scope, key)
     existing = db.scalar(select(IdempotencyKey).where(IdempotencyKey.actor == str(person.user_id), IdempotencyKey.scope == scope, IdempotencyKey.key == key))
     if existing:
         if existing.request_hash != digest:
             raise APIError(409, "IDEMPOTENCY_CONFLICT", "That operation key was already used with another payload.")
         return existing.response, digest
     return None, digest
+
+
+def write_lock(db: Session, person: Identity, *parts: str) -> None:
+    resource = json.dumps([str(person.workspace_id), str(person.user_id), *parts], separators=(",", ":"))
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:resource, 724319))"), {"resource": resource})
+
+
+def replace_assessment(db: Session, person: Identity, row: Opportunity) -> WorkflowRun:
+    runs = db.scalars(select(WorkflowRun).where(WorkflowRun.opportunity_id == row.id, WorkflowRun.status.in_(["queued", "running", "waiting_review", "needs_review", "interrupted", "resume_requested", "approved"])).with_for_update()).all()
+    for run in runs:
+        run.restore_hold, run.status, run.updated_at = True, "content_changed", utcnow()
+        run.version += 1
+    run = WorkflowRun(workspace_id=person.workspace_id, opportunity_id=row.id, thread_id=f"kajh-p1-{uuid4()}", graph_version="p1-v1", policy_version=POLICY_VERSION, requested_by=person.user_id, budget={"paid_calls": 0, "limit": 0, "opportunity_version": row.version})
+    db.add(run)
+    db.flush()
+    return run
 
 
 def idem_finish(db: Session, person: Identity, scope: str, key: str | None, digest: str, response: dict):
@@ -149,9 +179,9 @@ def visible_opportunities():
     return (
         Opportunity.merged_into.is_(None),
         Opportunity.lifecycle.not_in(["expired", "purged"]),
-        or_(Opportunity.expires_at.is_(None), Opportunity.expires_at > func.now()),
-        exists(select(OpportunitySource.id).join(RawObservation, RawObservation.id == OpportunitySource.observation_id).where(OpportunitySource.opportunity_id == Opportunity.id, RawObservation.expires_at > func.now(), func.app.source_visible(OpportunitySource.source_id))),
-        ~exists(select(OpportunitySource.id).outerjoin(RawObservation, RawObservation.id == OpportunitySource.observation_id).where(OpportunitySource.opportunity_id == Opportunity.id, or_(RawObservation.id.is_(None), RawObservation.expires_at <= func.now(), func.app.source_visible(OpportunitySource.source_id).is_not(True)))),
+        or_(Opportunity.expires_at.is_(None), Opportunity.expires_at > func.clock_timestamp()),
+        exists(select(OpportunitySource.id).join(RawObservation, RawObservation.id == OpportunitySource.observation_id).where(OpportunitySource.opportunity_id == Opportunity.id, RawObservation.expires_at > func.clock_timestamp(), func.app.source_visible(OpportunitySource.source_id))),
+        ~exists(select(OpportunitySource.id).outerjoin(RawObservation, RawObservation.id == OpportunitySource.observation_id).where(OpportunitySource.opportunity_id == Opportunity.id, or_(RawObservation.id.is_(None), RawObservation.expires_at <= func.clock_timestamp(), func.app.source_visible(OpportunitySource.source_id).is_not(True)))),
     )
 
 
@@ -222,7 +252,7 @@ async def logout(request: Request, response: Response, person: Identity = Depend
 def dashboard(person: Identity = Depends(identity), db: Session = Depends(database)):
     counts = dict(db.execute(select(Opportunity.eligibility, func.count()).where(*visible_opportunities()).group_by(Opportunity.eligibility)).all())
     recent = db.scalars(select(Opportunity).where(*visible_opportunities()).order_by(Opportunity.last_seen.desc()).limit(6)).all()
-    saved = db.scalar(select(func.count()).select_from(SavedOpportunity).where(SavedOpportunity.user_id == person.user_id)) or 0
+    saved = db.scalar(select(func.count()).select_from(SavedOpportunity).join(Opportunity, Opportunity.id == SavedOpportunity.opportunity_id).where(SavedOpportunity.user_id == person.user_id, *visible_opportunities())) or 0
     sources = db.scalars(select(Source).order_by(Source.name)).all()
     return {"counts": {"total": sum(counts.values()), "eligible": counts.get("Eligible", 0), "ineligible": counts.get("Ineligible", 0), "unknown": counts.get("Unknown", 0), "needs_review": counts.get("Needs Review", 0), "review_queue": counts.get("Unknown", 0) + counts.get("Needs Review", 0), "saved": saved, "active_sources": sum(s.enabled and not s.killed for s in sources)}, "recent": [opportunity_dto(db, person, row) for row in recent], "source_health": [objdict(s) for s in sources], "capabilities": {"ai_ranking": False, "live_verification": False, "digests": False, "external_dispatch": False}}
 
@@ -257,10 +287,10 @@ def opportunity(item_id: UUID, request: Request, person: Identity = Depends(iden
     row = db.scalar(select(Opportunity).where(Opportunity.id == item_id, *visible_opportunities()))
     if not row:
         raise APIError(404, "NOT_FOUND", "Opportunity evidence is unavailable or its retention permission expired.")
-    sources = db.execute(select(OpportunitySource, Source.name).join(Source, Source.id == OpportunitySource.source_id).join(RawObservation, RawObservation.id == OpportunitySource.observation_id).where(OpportunitySource.opportunity_id == item_id, RawObservation.expires_at > func.now(), func.app.source_visible(Source.id))).all()
+    sources = db.execute(select(OpportunitySource, Source.name).join(Source, Source.id == OpportunitySource.source_id).join(RawObservation, RawObservation.id == OpportunitySource.observation_id).where(OpportunitySource.opportunity_id == item_id, RawObservation.expires_at > func.clock_timestamp(), func.app.source_visible(Source.id))).all()
     # Historical excerpts inherit the rights and expiry of their own observation,
     # even after the current provenance link has refreshed to a newer observation.
-    retained_evidence = exists(select(RawObservation.id).where(RawObservation.id.cast(String) == EligibilityEvidence.details["observation_id"].astext, RawObservation.workspace_id == EligibilityEvidence.workspace_id, RawObservation.expires_at > func.now(), func.app.source_visible(RawObservation.source_id)))
+    retained_evidence = exists(select(RawObservation.id).join(OpportunitySource, (OpportunitySource.source_id == RawObservation.source_id) & (OpportunitySource.external_id == RawObservation.external_id) & (OpportunitySource.workspace_id == RawObservation.workspace_id)).where(OpportunitySource.opportunity_id == item_id, RawObservation.id.cast(String) == EligibilityEvidence.details["observation_id"].astext, RawObservation.workspace_id == EligibilityEvidence.workspace_id, RawObservation.expires_at > func.clock_timestamp(), func.app.source_visible(RawObservation.source_id)))
     current_derived = EligibilityEvidence.details["observation_id"].astext.is_(None) & (EligibilityEvidence.details["content_version"].astext == str(row.version))
     evidence = db.scalars(select(EligibilityEvidence).where(EligibilityEvidence.opportunity_id == item_id, or_(retained_evidence, current_derived)).order_by(EligibilityEvidence.created_at)).all()
     history = db.scalars(select(AuditEvent).where(AuditEvent.object_id == str(item_id)).order_by(AuditEvent.created_at.desc()).limit(50)).all()
@@ -279,6 +309,9 @@ def review(item_id: UUID, body: ReviewInput, request: Request, person: Identity 
     if row.version != body.version:
         raise APIError(412, "STALE_VERSION", "The opportunity changed. Refresh before reviewing.")
     bounded_object(body.facts)
+    protected = {key for key in body.facts if key.startswith("_")} | {"synthetic", "category", "requisition_id", "split_from", "expired"}
+    if any(key in body.facts and (key not in row.facts or not strict_json_equal(body.facts[key], row.facts[key])) for key in protected):
+        raise APIError(422, "RESERVED_FACT", "Source provenance and internal assessment fields cannot be edited.")
     facts = {**row.facts, **body.facts}
     vendor = db.scalar(select(VendorProfile).order_by(VendorProfile.version.desc()).limit(1))
     try:
@@ -288,22 +321,30 @@ def review(item_id: UUID, body: ReviewInput, request: Request, person: Identity 
     row.facts = facts
     row.eligibility = result["status"]
     row.version += 1
+    run = replace_assessment(db, person, row)
     for rule in result["rules"]:
         db.add(EligibilityEvidence(workspace_id=person.workspace_id, opportunity_id=row.id, rule=rule["rule_id"], outcome=rule["status"], details={**rule, "review_reason": body.reason, "reviewer": str(person.user_id), "content_version": row.version}))
-    record(db, person, request, "opportunity.reviewed", "opportunity", row.id, {"reason": body.reason, "status": row.eligibility, "version": row.version})
-    response = {"id": str(row.id), "version": row.version, "eligibility": row.eligibility}
+    record(db, person, request, "opportunity.reviewed", "opportunity", row.id, {"reason": body.reason, "status": row.eligibility, "version": row.version, "workflow_run_id": str(run.id)})
+    response = {"id": str(row.id), "version": row.version, "eligibility": row.eligibility, "workflow_run_id": str(run.id)}
     return idem_finish(db, person, f"review:{item_id}", idempotency_key, digest, response)
 
 
 @app.put("/api/v1/opportunities/{item_id}/saved")
 def save(item_id: UUID, body: SavedInput, request: Request, person: Identity = Depends(require_write), db: Session = Depends(database)):
-    get_or_404(db, Opportunity, item_id)
+    write_lock(db, person, "saved", str(item_id))
+    if body.saved:
+        row = db.scalar(select(Opportunity).where(Opportunity.id == item_id, *visible_opportunities()))
+        if row is None:
+            raise APIError(404, "NOT_FOUND", "Opportunity evidence is unavailable.")
+    else:
+        get_or_404(db, Opportunity, item_id)
     existing = db.scalar(select(SavedOpportunity).where(SavedOpportunity.opportunity_id == item_id, SavedOpportunity.user_id == person.user_id))
     if body.saved and not existing:
         db.add(SavedOpportunity(workspace_id=person.workspace_id, user_id=person.user_id, opportunity_id=item_id))
     elif not body.saved and existing:
         db.delete(existing)
-    record(db, person, request, "opportunity.saved" if body.saved else "opportunity.unsaved", "opportunity", item_id)
+    if body.saved != bool(existing):
+        record(db, person, request, "opportunity.saved" if body.saved else "opportunity.unsaved", "opportunity", item_id)
     return {"id": str(item_id), "saved": body.saved}
 
 
@@ -325,6 +366,8 @@ def update_vendor(body: VendorInput, request: Request, person: Identity = Depend
     if not previous or previous.version != body.version:
         raise APIError(412, "STALE_VERSION", "Vendor profile changed. Refresh before saving.")
     profile = bounded_object(body.profile)
+    if "data" in profile or any(profile.get(key) is not None and not isinstance(profile[key], dict) for key in ("legal_entity", "rate_preferences")):
+        raise APIError(422, "INVALID_PROFILE", "Use a direct vendor profile with object-valued legal entity and rate preferences.")
     profile["synthetic"] = True
     profile["verified"] = False
     legal = dict(profile.get("legal_entity") or {})
@@ -425,7 +468,10 @@ def update_source(source_id: UUID, body: SourceUpdate, request: Request, person:
         try:
             validate_source_policy({"adapter_type": row.adapter_type, "enabled": row.enabled, "killed": row.killed}, row.permission)
         except ValueError:
-            raise APIError(409, "SOURCE_POLICY_BLOCKED", "A current approved policy is required before enabling the synthetic source.") from None
+            if body.enabled is True:
+                raise APIError(409, "SOURCE_POLICY_BLOCKED", "A current approved policy is required before enabling the synthetic source.") from None
+            # Rights can be revoked without a separate disable request.
+            row.enabled = False
     row.permission_version += 1
     db.add(SourcePermission(workspace_id=person.workspace_id, source_id=row.id, version=row.permission_version, body={**row.permission, "enabled": row.enabled, "killed": row.killed}))
     record(db, person, request, "source.policy_changed", "source", row.id, {"version": row.permission_version, "enabled": row.enabled, "killed": row.killed})
@@ -446,7 +492,8 @@ def ingest(source_id: UUID, request: Request, person: Identity = Depends(require
         validate_source_policy({"adapter_type": source.adapter_type, "enabled": source.enabled, "killed": source.killed}, source.permission)
     except Exception:
         raise APIError(409, "SOURCE_POLICY_BLOCKED", "The source is disabled, expired, revoked, or lacks permission.") from None
-    job = Job(workspace_id=person.workspace_id, source_id=source.id, kind="ingest", payload={"requested_by": str(person.user_id)}, idempotency_key=f"api:{person.user_id}:{idempotency_key}", request_hash=digest)
+    operation_key = hashlib.sha256(json.dumps([str(person.workspace_id), str(person.user_id), str(source.id), idempotency_key], separators=(",", ":")).encode()).hexdigest()
+    job = Job(workspace_id=person.workspace_id, source_id=source.id, kind="ingest", payload={"requested_by": str(person.user_id)}, idempotency_key=f"api-ingest:{operation_key}", request_hash=digest)
     db.add(job)
     db.flush()
     record(db, person, request, "ingestion.requested", "job", job.id)
@@ -474,6 +521,13 @@ def resume(run_id: UUID, body: ResumeInput, request: Request, person: Identity =
     existing, digest = idem_start(db, person, scope, idempotency_key, body.model_dump())
     if existing:
         return existing
+    opportunity_id = db.scalar(select(WorkflowRun.opportunity_id).where(WorkflowRun.id == run_id))
+    if not opportunity_id:
+        raise APIError(404, "NOT_FOUND", "Workflow not found.")
+    # Content mutations and resume use the same opportunity-before-run lock order.
+    opportunity = db.scalar(select(Opportunity).where(Opportunity.id == opportunity_id, *visible_opportunities()).with_for_update())
+    if not opportunity:
+        raise APIError(409, "EVIDENCE_UNAVAILABLE", "Current permitted source evidence is required before resuming.")
     run = db.scalar(select(WorkflowRun).where(WorkflowRun.id == run_id).with_for_update())
     if not run:
         raise APIError(404, "NOT_FOUND", "Workflow not found.")
@@ -481,7 +535,8 @@ def resume(run_id: UUID, body: ResumeInput, request: Request, person: Identity =
         raise APIError(412, "STALE_VERSION", "Workflow changed. Refresh before resuming.")
     if run.restore_hold or run.status not in {"needs_review", "interrupted", "waiting_review"}:
         raise APIError(409, "WORKFLOW_NOT_RESUMABLE", "This workflow cannot be resumed in its current state.")
-    opportunity = get_or_404(db, Opportunity, run.opportunity_id)
+    if run.graph_version != "p1-v1" or run.policy_version != POLICY_VERSION or type(run.budget.get("opportunity_version")) is not int or run.budget["opportunity_version"] != opportunity.version:
+        raise APIError(409, "CONTENT_CHANGED", "The workflow no longer matches the current opportunity. Use its replacement assessment.")
     payload_hash = hashlib.sha256(f"{run.thread_id}:{opportunity.version}:review".encode()).hexdigest()
     decision = WorkflowDecision(workspace_id=person.workspace_id, run_id=run.id, user_id=person.user_id, decision="approved", payload_hash=payload_hash, content_version=opportunity.version, expires_at=utcnow() + timedelta(minutes=15))
     db.add(decision)
@@ -502,16 +557,25 @@ def audit_events(person: Identity = Depends(identity), db: Session = Depends(dat
 
 
 @app.post("/api/v1/opportunities/{item_id}/unmerge")
-def unmerge(item_id: UUID, request: Request, person: Identity = Depends(require_write), db: Session = Depends(database)):
+def unmerge(item_id: UUID, body: UnmergeInput, request: Request, person: Identity = Depends(require_write), db: Session = Depends(database), idempotency_key: str | None = Header(default=None)):
     require_owner(person)
-    row = get_or_404(db, Opportunity, item_id)
+    scope = f"unmerge:{item_id}"
+    previous_response, digest = idem_start(db, person, scope, idempotency_key, body.model_dump())
+    if previous_response:
+        return previous_response
+    row = db.scalar(select(Opportunity).where(Opportunity.id == item_id, *visible_opportunities()[1:]).with_for_update())
+    if not row:
+        raise APIError(404, "NOT_FOUND", "Current permitted opportunity evidence is required.")
+    if row.version != body.version:
+        raise APIError(412, "STALE_VERSION", "Opportunity changed. Refresh before reversing reconciliation.")
     if row.merged_into is None:
         raise APIError(409, "NOT_MERGED", "This opportunity is not merged.")
     previous = row.merged_into
     row.merged_into = None
     row.version += 1
-    record(db, person, request, "opportunity.unmerged", "opportunity", row.id, {"previous_target": str(previous)})
-    return {"id": str(row.id), "version": row.version, "merged_into": None}
+    run = replace_assessment(db, person, row)
+    record(db, person, request, "opportunity.unmerged", "opportunity", row.id, {"previous_target": str(previous), "reason": body.reason, "workflow_run_id": str(run.id)})
+    return idem_finish(db, person, scope, idempotency_key, digest, {"id": str(row.id), "version": row.version, "merged_into": None, "workflow_run_id": str(run.id)})
 
 
 @app.post("/api/v1/opportunities/{item_id}/split-source", status_code=201)
@@ -522,9 +586,9 @@ def split_source(item_id: UUID, body: SplitSourceInput, request: Request, person
     previous, digest = idem_start(db, person, scope, idempotency_key, body.model_dump())
     if previous:
         return previous
-    original = db.scalar(select(Opportunity).where(Opportunity.id == item_id).with_for_update())
+    original = db.scalar(select(Opportunity).where(Opportunity.id == item_id, *visible_opportunities()).with_for_update())
     if not original:
-        raise APIError(404, "NOT_FOUND", "Opportunity not found.")
+        raise APIError(404, "NOT_FOUND", "Current permitted opportunity evidence is required.")
     if original.version != body.version:
         raise APIError(412, "STALE_VERSION", "Opportunity changed. Refresh before separating sources.")
     try:
@@ -535,38 +599,49 @@ def split_source(item_id: UUID, body: SplitSourceInput, request: Request, person
     link = next((value for value in links if value.id == link_id), None)
     if not link or len(links) < 2:
         raise APIError(409, "NOT_SPLITTABLE", "A shared canonical opportunity needs at least two source references.")
-    if not db.scalar(select(func.app.source_visible(link.source_id))):
-        raise APIError(409, "SOURCE_POLICY_BLOCKED", "The selected source is no longer permitted.")
     observation = get_or_404(db, RawObservation, link.observation_id)
-    if observation.expires_at <= utcnow():
-        raise APIError(409, "EVIDENCE_EXPIRED", "Source evidence expired.")
-    normalized = normalize_opportunity(observation.payload, str(link.source_id))
+    if observation.expires_at <= utcnow() or not db.scalar(select(func.app.source_visible(link.source_id))):
+        raise APIError(409, "EVIDENCE_UNAVAILABLE", "The selected source evidence is no longer permitted.")
+    remaining_ids = [value.observation_id for value in links if value.id != link.id]
+    remaining = list(db.scalars(select(RawObservation).where(RawObservation.id.in_(remaining_ids), RawObservation.expires_at > func.clock_timestamp(), func.app.source_visible(RawObservation.source_id)).order_by(RawObservation.observed_at.desc(), RawObservation.id)))
+    if len(remaining) != len(remaining_ids):
+        raise APIError(409, "EVIDENCE_UNAVAILABLE", "All remaining references need current retention permission.")
     vendor = db.scalar(select(VendorProfile).order_by(VendorProfile.version.desc()).limit(1))
-    facts = {**normalized["facts"], "category": normalized["category"], "synthetic": True, "split_from": str(original.id), "requisition_id": normalized.get("requisition_id")}
-    assessment = evaluate_eligibility({**normalized, "facts": facts}, vendor.profile if vendor else None)
-    separated = Opportunity(workspace_id=person.workspace_id, title=normalized["title"], organization=normalized["employer"]["name"], organization_domain=normalized["employer"].get("domain"), category=normalized["category"], description=normalized["description"], facts=facts, skills=normalized["skills"], eligibility=assessment["status"], workplace=facts.get("workplace_type", "Unknown"), country=(facts.get("delivery_countries") or [None])[0], dedupe_key=None, first_seen=observation.observed_at, last_seen=observation.observed_at, expires_at=observation.expires_at)
+    profile = vendor.profile if vendor else {}
+
+    def reconstruct(observed: RawObservation, *, split_from: UUID | None = None):
+        record = normalize_opportunity(observed.payload, str(observed.source_id), observed_at=observed.observed_at)
+        facts = {**record["facts"], "category": record["category"], "synthetic": True,
+                 "requisition_id": record.get("requisition_id"), "_canonical_hash": canonical_hash(record),
+                 "_vendor_profile_hash": vendor_hash(profile), "_source_evidence": record.get("evidence", [])}
+        if split_from:
+            facts["split_from"] = str(split_from)
+        result = evaluate_eligibility({**record, "facts": facts}, profile)
+        lifecycle = "closed" if any(rule["rule_id"] == "closing_date" and rule["status"] == "Ineligible" for rule in result["rules"]) else "open"
+        values = {"title": record["title"], "organization": record["employer"]["name"], "organization_domain": record["employer"].get("domain"),
+                  "category": record["category"], "description": record["description"], "facts": facts, "skills": record["skills"],
+                  "eligibility": result["status"], "lifecycle": lifecycle, "workplace": facts.get("workplace_type", "Unknown"),
+                  "country": (facts.get("delivery_countries") or [None])[0]}
+        return record, result, values
+
+    _record, assessment, values = reconstruct(observation, split_from=original.id)
+    separated = Opportunity(workspace_id=person.workspace_id, **values, dedupe_key=None, first_seen=observation.observed_at, last_seen=observation.observed_at, expires_at=observation.expires_at)
     db.add(separated)
     db.flush()
     link.opportunity_id = separated.id
-    remaining_links = [value for value in links if value.id != link.id]
-    remaining_observation = db.get(RawObservation, remaining_links[0].observation_id)
-    if remaining_observation:
-        remaining_record = normalize_opportunity(remaining_observation.payload, str(remaining_links[0].source_id))
-        remaining_facts = {**remaining_record["facts"], "category": remaining_record["category"], "synthetic": True, "requisition_id": remaining_record.get("requisition_id")}
-        remaining_assessment = evaluate_eligibility({**remaining_record, "facts": remaining_facts}, vendor.profile if vendor else None)
-        original.title = remaining_record["title"]
-        original.organization = remaining_record["employer"]["name"]
-        original.organization_domain = remaining_record["employer"].get("domain")
-        original.category = remaining_record["category"]
-        original.description = remaining_record["description"]
-        original.facts = remaining_facts
-        original.skills = remaining_record["skills"]
-        original.eligibility = remaining_assessment["status"]
-        original.workplace = remaining_facts.get("workplace_type", "Unknown")
-        original.country = (remaining_facts.get("delivery_countries") or [None])[0]
+    remaining_record, remaining_assessment, remaining_values = reconstruct(remaining[0])
+    for name, value in remaining_values.items():
+        setattr(original, name, value)
+    original.dedupe_key = dedupe_key(remaining_record)
+    original.first_seen = min(value.observed_at for value in remaining)
+    original.last_seen = max(value.observed_at for value in remaining)
+    original.expires_at = max(value.expires_at for value in remaining)
     original.version += 1
-    for rule in assessment["rules"]:
-        db.add(EligibilityEvidence(workspace_id=person.workspace_id, opportunity_id=separated.id, rule=rule["rule_id"], outcome=rule["status"], details={**rule, "source_id": str(link.source_id), "observation_id": str(observation.id), "content_version": 1}))
-    record(db, person, request, "opportunity.source_separated", "opportunity", original.id, {"new_opportunity_id": str(separated.id), "source_link_id": str(link.id), "reason": body.reason})
-    record(db, person, request, "opportunity.separated_from", "opportunity", separated.id, {"original_id": str(original.id), "reason": body.reason})
-    return idem_finish(db, person, scope, idempotency_key, digest, {"id": str(separated.id), "original_id": str(original.id), "source_link_id": str(link.id), "version": 1})
+    for target, source_observation, result in ((separated, observation, assessment), (original, remaining[0], remaining_assessment)):
+        for rule in result["rules"]:
+            db.add(EligibilityEvidence(workspace_id=person.workspace_id, opportunity_id=target.id, rule=rule["rule_id"], outcome=rule["status"], details={**rule, "source_id": str(source_observation.source_id), "observation_id": str(source_observation.id), "content_version": target.version, "policy_version": POLICY_VERSION}))
+    original_run = replace_assessment(db, person, original)
+    separated_run = replace_assessment(db, person, separated)
+    record(db, person, request, "opportunity.source_separated", "opportunity", original.id, {"new_opportunity_id": str(separated.id), "source_link_id": str(link.id), "reason": body.reason, "workflow_run_id": str(original_run.id)})
+    record(db, person, request, "opportunity.separated_from", "opportunity", separated.id, {"original_id": str(original.id), "reason": body.reason, "workflow_run_id": str(separated_run.id)})
+    return idem_finish(db, person, scope, idempotency_key, digest, {"id": str(separated.id), "original_id": str(original.id), "source_link_id": str(link.id), "version": 1, "workflow_run_id": str(separated_run.id), "original_workflow_run_id": str(original_run.id)})

@@ -7,6 +7,11 @@ const ALLOWED_ROOTS = new Set([
   "auth", "dashboard", "opportunities", "vendor-profile", "search-profiles",
   "sources", "source-runs", "jobs", "workflow-runs", "audit-events"
 ]);
+const MAX_BODY_BYTES = 1_048_576;
+
+function failure(code: string, message: string, status: number) {
+  return Response.json({ error: { code, message } }, { status, headers: { "cache-control": "no-store, private" } });
+}
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
@@ -14,9 +19,12 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
     return Response.json({ error: { code: "ROUTE_NOT_ALLOWED", message: "This API route is unavailable." } }, { status: 404 });
   }
 
-  const base = new URL(process.env.API_BASE_URL ?? "http://127.0.0.1:8210");
-  if (base.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(base.hostname) || base.port !== "8210" || base.username || base.password || base.pathname !== "/") {
-    return Response.json({ error: { code: "CONFIGURATION_ERROR", message: "The local API endpoint is not configured correctly." } }, { status: 503 });
+  let base: URL;
+  try {
+    base = new URL(process.env.API_BASE_URL ?? "http://127.0.0.1:8210");
+    if (base.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(base.hostname) || base.port !== "8210" || base.username || base.password || base.pathname !== "/" || base.search || base.hash) throw new Error();
+  } catch {
+    return failure("CONFIGURATION_ERROR", "The local API endpoint is not configured correctly.", 503);
   }
 
   const url = new URL(`/api/${path.join("/")}`, base);
@@ -29,9 +37,30 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
 
   let body: ArrayBuffer | undefined;
   if (!["GET", "HEAD"].includes(request.method)) {
-    if (Number(request.headers.get("content-length") ?? 0) > 1_048_576) return Response.json({ error: { code: "BODY_TOO_LARGE", message: "Request is too large." } }, { status: 413 });
-    body = await request.arrayBuffer();
-    if (body.byteLength > 1_048_576) return Response.json({ error: { code: "BODY_TOO_LARGE", message: "Request is too large." } }, { status: 413 });
+    if (Number(request.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) return failure("BODY_TOO_LARGE", "Request is too large.", 413);
+    const reader = request.body?.getReader();
+    if (reader) {
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+          if (bytes > MAX_BODY_BYTES) {
+            void reader.cancel().catch(() => undefined);
+            return failure("BODY_TOO_LARGE", "Request is too large.", 413);
+          }
+          chunks.push(value);
+        }
+      } catch {
+        return failure("INVALID_REQUEST_BODY", "The request body could not be read.", 400);
+      } finally { reader.releaseLock(); }
+      const combined = new Uint8Array(bytes);
+      let offset = 0;
+      for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
+      body = combined.buffer;
+    }
   }
 
   try {

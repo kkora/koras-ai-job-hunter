@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
+from pathlib import Path
 import random
 import secrets
 import time
@@ -15,6 +17,11 @@ from psycopg import sql
 from bootstrap import LOCAL, load_env
 from init_roles import init_roles
 from local_runtime import assert_owned, compose, docker, is_missing_resource
+
+
+def require_validation_assertions() -> None:
+    if not __debug__:
+        raise RuntimeError("Runtime validation requires Python assertions; remove -O or PYTHONOPTIMIZE")
 
 
 def connect(*, restore: bool = False, role: str = "postgres"):
@@ -32,12 +39,25 @@ def connect(*, restore: bool = False, role: str = "postgres"):
 
 
 def write_evidence(name: str, result: dict) -> dict:
-    value = {"recorded_at": datetime.now(timezone.utc).isoformat(), "authorization": "KAJH-P1-AUTH-001", **result}
-    (LOCAL / "evidence" / name).write_text(json.dumps(value, indent=2, default=str) + "\n")
+    if Path(name).name != name or not name.endswith(".json"):
+        raise ValueError("Evidence must use a JSON filename inside the owned evidence directory")
+    now = datetime.now(timezone.utc)
+    target = LOCAL / "evidence" / name
+    while True:
+        try:
+            output = target.open("x")
+            break
+        except FileExistsError:
+            target = target.with_name(f"{Path(name).stem}-{now.strftime('%Y%m%dT%H%M%S%fZ')}-{secrets.token_hex(4)}.json")
+    value = {**result, "recorded_at": now.isoformat(), "authorization": "KAJH-P1-AUTH-001", "evidence_file": target.name}
+    with output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(json.dumps(value, indent=2, default=str) + "\n")
     return value
 
 
 def vector_probe(rows: int = 10000, dimensions: int = 1536, queries: int = 50) -> dict:
+    require_validation_assertions()
     schema = "kajh_e09_" + secrets.token_hex(5)
     quoted = '"' + schema + '"'
     started = time.perf_counter()
@@ -134,6 +154,7 @@ def snapshot(conn) -> dict:
 
 
 def backup_restore() -> dict:
+    require_validation_assertions()
     import subprocess
     import sys
     from uuid import uuid4
@@ -143,13 +164,12 @@ def backup_restore() -> dict:
 
     env=load_env()
     project=env["KAJH_PROJECT"]
-    backup=LOCAL/"backups"/("kajh-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")+".dump")
+    backup=LOCAL/"backups"/("kajh-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")+"-"+secrets.token_hex(4)+".dump")
     started=time.perf_counter()
     for service in ("api","worker","auth","db"):
         assert_owned("container",f"{project}-{service}")
-    # No application service ever points at the restore database.
-    compose("stop","--timeout","30","api","worker","auth")
     restore_created=False
+    backup_created=False
     probe=None
     primary_before=None
 
@@ -184,14 +204,19 @@ def backup_restore() -> dict:
                             (identifier,probe["workspace"],probe["run"],probe["owner"],digest,row[1]))
 
     try:
+        # Quiescing can fail after stopping only some services. Keep it inside
+        # the recovery boundary so that even a partial shutdown is restarted.
+        # No application service ever points at the restore database.
+        compose("stop","--timeout","30","api","worker","auth")
         with connect() as source:
             primary_before=snapshot(source)
-            row=source.execute("SELECT o.id,o.workspace_id,m.user_id FROM app.opportunities o JOIN app.memberships m ON m.workspace_id=o.workspace_id AND m.role='Owner' AND m.active WHERE o.eligibility='Unknown' AND o.lifecycle='open' AND o.facts->>'synthetic'='true' AND EXISTS(SELECT 1 FROM app.opportunity_sources l JOIN app.sources s ON s.id=l.source_id JOIN app.raw_observations x ON x.id=l.observation_id WHERE l.opportunity_id=o.id AND s.adapter_type='synthetic' AND s.enabled AND NOT s.killed AND x.expires_at>clock_timestamp()) ORDER BY o.id LIMIT 1").fetchone()
+            row=source.execute("SELECT o.id,o.workspace_id,m.user_id,o.version FROM app.opportunities o JOIN app.memberships m ON m.workspace_id=o.workspace_id AND m.role='Owner' AND m.active WHERE o.eligibility='Unknown' AND o.lifecycle='open' AND o.facts->>'synthetic'='true' AND EXISTS(SELECT 1 FROM app.opportunity_sources l JOIN app.sources s ON s.id=l.source_id JOIN app.raw_observations x ON x.id=l.observation_id WHERE l.opportunity_id=o.id AND s.adapter_type='synthetic' AND s.enabled AND NOT s.killed AND x.expires_at>clock_timestamp()) ORDER BY o.id LIMIT 1").fetchone()
             assert row,"A live synthetic Unknown opportunity and Owner are required"
             probe={"run":uuid4(),"old_decision":uuid4(),"fresh_decision":uuid4(),
                    "thread":"kajh-e09-restore-"+uuid4().hex,"opportunity":row[0],"workspace":row[1],"owner":row[2]}
-            source.execute("INSERT INTO app.workflow_runs(id,workspace_id,opportunity_id,thread_id,graph_version,policy_version,status,budget,restore_hold,requested_by,version,created_at,updated_at) VALUES(%s,%s,%s,%s,'p1-v1','kajh-eligibility-1.0','test_pending','{\"paid_calls\":0,\"limit\":0,\"mock_mode\":\"crash_after_consume\"}'::jsonb,false,%s,1,clock_timestamp(),clock_timestamp())",
-                           (probe["run"],probe["workspace"],probe["opportunity"],probe["thread"],probe["owner"]))
+            budget=json.dumps({"paid_calls":0,"limit":0,"mock_mode":"crash_after_consume","opportunity_version":row[3]})
+            source.execute("INSERT INTO app.workflow_runs(id,workspace_id,opportunity_id,thread_id,graph_version,policy_version,status,budget,restore_hold,requested_by,version,created_at,updated_at) VALUES(%s,%s,%s,%s,'p1-v1','kajh-eligibility-1.0','test_pending',%s::jsonb,false,%s,1,clock_timestamp(),clock_timestamp())",
+                           (probe["run"],probe["workspace"],probe["opportunity"],probe["thread"],budget,probe["owner"]))
         run_code="import asyncio; from kajh_worker.workflow import run_workflow; "
         assert worker_probe(run_code+f"assert asyncio.run(run_workflow('{probe['run']}'))=='waiting_review'")==""
         record_approval(probe["old_decision"])
@@ -204,6 +229,7 @@ def backup_restore() -> dict:
             probe_checkpoints=source.execute("SELECT count(*) FROM checkpoints.checkpoints WHERE thread_id=%s",(probe["thread"],)).fetchone()[0]
             assert probe_checkpoints>0
         with backup.open("xb") as output:
+            backup_created=True
             backup.chmod(0o600)
             docker("exec",project+"-db","pg_dump","-U","postgres","-d","kajh_dev","--format=custom",stdout=output)
         with backup.open("rb") as archive:
@@ -316,7 +342,7 @@ def backup_restore() -> dict:
                     except Exception as error:
                         cleanup_errors.append(name+":"+type(error).__name__)
             try:
-                if backup.exists():
+                if backup_created and backup.exists():
                     backup.unlink()
             except OSError as error:
                 cleanup_errors.append("temporary_dump:"+type(error).__name__)
@@ -336,6 +362,7 @@ def backup_restore() -> dict:
 
 
 def runtime_inventory() -> dict:
+    require_validation_assertions()
     env=load_env()
     project=env["KAJH_PROJECT"]
     services={}

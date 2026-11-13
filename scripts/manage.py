@@ -114,6 +114,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("prepare", "up", "resume", "migrate", "seed", "web", "stop", "status", "test", "credentials", "backup-restore"))
     args, extra = parser.parse_known_args()
+    if extra and args.command != "test":
+        parser.error("unrecognized arguments: " + " ".join(extra))
     if args.command == "prepare":
         bootstrap()
         return

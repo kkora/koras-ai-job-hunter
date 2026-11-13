@@ -29,6 +29,18 @@ RATE_UNITS = {
     "fixed": "project", "fixed-price": "project", "year": "year", "annual": "year",
 }
 CURRENCIES = {"USD", "CAD", "EUR", "GBP", "AUD", "NZD", "INR", "SGD", "CHF", "JPY", "AED", "SEK", "NOK", "DKK", "PLN", "BRL", "ZAR", "MXN"}
+BOOLEAN_FACTS = {"b2b_accepted", "c2c_accepted", "w2_only", "employee_only", "incorporated_vendor_required",
+    "requires_c2c", "vendor_country_unrestricted", "delivery_worldwide", "subcontracting_allowed", "confirmed_fraud"}
+
+
+def boolean_claim_conflicts(record: Mapping[str, Any], facts: Mapping[str, Any], terms: Mapping[str, Any]) -> list[dict[str, Any]]:
+    conflicts = []
+    for field in sorted(BOOLEAN_FACTS):
+        claims = [{"source": name, "value": mapping[field]} for name, mapping in
+            (("facts", facts), ("terms", terms), ("record", record)) if type(mapping.get(field)) is bool]
+        if {claim["value"] for claim in claims} == {True, False}:
+            conflicts.append({"field": field, "claims": claims})
+    return conflicts
 
 
 def normalize_skills(values: Any) -> list[str]:
@@ -56,7 +68,16 @@ def _number(value: Any) -> str | None:
         return None
     if not number.is_finite() or number < 0:
         return None
-    return format(number.normalize(), "f")
+    # Avoid materializing an attacker-supplied exponent into an enormous string.
+    exponent = number.as_tuple().exponent
+    if not isinstance(exponent, int) or abs(exponent) > 100 or abs(number.adjusted()) > 100:
+        return None
+    fixed = format(number, "f")
+    # Decimal.normalize() applies the process precision context and can round
+    # contractual amounts. Formatting preserves every supplied bounded digit.
+    if "." in fixed:
+        fixed = fixed.rstrip("0").rstrip(".")
+    return "0" if number == 0 else fixed
 
 
 def _timestamp(value: Any) -> str | None:
@@ -94,7 +115,8 @@ def normalize_opportunity(
     if not isinstance(raw, Mapping):
         raise ValueError("Opportunity payload must be an object")
     now = observed_at or datetime.now(timezone.utc)
-    title = " ".join(str(raw.get("title", "")).split())[:300]
+    title_value = raw.get("title")
+    title = " ".join(title_value.split())[:300] if isinstance(title_value, str) else ""
     if not title:
         raise ValueError("Opportunity title is required")
     description = html.unescape(str(raw.get("description", "")))[:100_000]
@@ -119,11 +141,16 @@ def normalize_opportunity(
         "workplace_type", "onsite_country", "onsite_days", "onboarding_required",
         "duration_months", "subcontracting_allowed", "procurement_requirements",
         "confirmed_fraud", "suspicious_indicators", "contradictions",
+        "contract_type", "requires_c2c", "vendor_country_unrestricted", "delivery_worldwide", "no_closing_date",
     ):
         if field in raw and field not in facts:
             facts[field] = raw[field]
         if field in terms and field not in facts:
             facts[field] = terms[field]
+    conflicts = boolean_claim_conflicts(raw, facts, terms)
+    if conflicts:
+        existing = facts.get("contradictions")
+        facts["contradictions"] = [*(existing if isinstance(existing, list) else []), *conflicts]
     for field in ("rate_min", "rate_max"):
         terms[field] = _number(terms.get(field, raw.get(field)))
     currency = terms.get("currency", raw.get("currency"))
@@ -135,15 +162,22 @@ def normalize_opportunity(
     # Annual employee compensation is retained as annual, never divided into a consulting rate.
     facts.update({key: terms[key] for key in ("rate_min", "rate_max", "currency", "rate_unit")})
     published = _timestamp(raw.get("published_at"))
-    closing = _timestamp(raw.get("closing_at", facts.get("closing_at")))
-    if raw.get("closing_at") is not None and closing is None:
+    closing_value = raw.get("closing_at", facts.get("closing_at"))
+    closing = _timestamp(closing_value)
+    if closing_value is not None and closing is None:
         facts["deadline_timezone_unknown"] = True
     facts["closing_at"] = closing
     category = raw.get("category", "job")
     if category not in {"job", "consulting_project", "subcontract", "procurement"}:
         raise ValueError("Unsupported opportunity category")
     reference = _safe_reference(raw.get("source_ref", raw.get("original_url")))
-    external_id = str(raw.get("external_id", "")).strip()[:300]
+    external_value = raw.get("external_id")
+    if external_value is not None and (isinstance(external_value, bool) or not isinstance(external_value, (str, int))):
+        raise ValueError("Source identity must be a string or integer")
+    external_id = str(external_value).strip() if external_value is not None else ""
+    # Bound the storage key without truncating distinct provider identities.
+    if len(external_id) > 200:
+        external_id = "id:" + hashlib.sha256(external_id.encode()).hexdigest()
     if not external_id:
         if not reference:
             raise ValueError("A source identity or original reference is required")
@@ -170,5 +204,15 @@ def dedupe_key(record: Mapping[str, Any]) -> str | None:
     domain = employer.get("domain") if isinstance(employer, Mapping) else None
     if not isinstance(requisition, str) or not requisition.strip() or not domain:
         return None
-    identity = f"{str(domain).lower().strip()}|{requisition.strip().casefold()}|{record.get('category', 'job')}"
+    identity = f"{str(domain).lower().strip()}|{requisition.strip()}|{record.get('category', 'job')}"
     return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def canonical_hash(record: Mapping[str, Any]) -> str:
+    """Hash canonical content independently of source observation identity."""
+    body = {key: record.get(key) for key in ("title", "description", "employer", "category", "skills", "facts", "terms", "requisition_id")}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def vendor_hash(profile: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(profile, sort_keys=True, default=str).encode()).hexdigest()

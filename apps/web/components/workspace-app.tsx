@@ -9,7 +9,7 @@ import {
   ListFilter, LoaderCircle, LockKeyhole, LogOut, Menu, MoreHorizontal, Play, Search, Settings2,
   ShieldCheck, SlidersHorizontal, Sparkles, X
 } from "lucide-react";
-import { api, ApiError, array, countryLabel, date, object, prettyLabel, rateLabel, setCsrf, str, type Dashboard, type JsonObject, type Opportunity, type OpportunityDetail, type OpportunityPage, type Session } from "@/lib/api";
+import { api, ApiError, SESSION_EXPIRED_EVENT, array, countryLabel, date, object, prettyLabel, rateLabel, setCsrf, str, type Dashboard, type JsonObject, type Opportunity, type OpportunityDetail, type OpportunityPage, type Session } from "@/lib/api";
 import { Breadcrumb, EmptyState, ErrorState, LoadingState, Modal, Notice, PageHeading, Panel, StatusBadge, useResource } from "@/components/ui";
 import { ProfilesPage, SourcesPage, VendorPage, WorkflowsPage } from "@/components/settings-pages";
 
@@ -37,6 +37,17 @@ export function WorkspaceApp() {
   const [globalQuery, setGlobalQuery] = useState("");
   const notify = useCallback((message: string) => setToast(message), []);
   const bump = useCallback(() => setRefresh(value => value + 1), []);
+
+  useEffect(() => {
+    function expired() {
+      if (!session) return;
+      setSession(null); setCsrf(""); setToast(""); setMobile(false);
+      setConnectionError(new Error("Your session ended. Sign in again to continue."));
+      router.replace("/login");
+    }
+    window.addEventListener(SESSION_EXPIRED_EVENT, expired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, expired);
+  }, [router, session]);
 
   useEffect(() => {
     let active = true;

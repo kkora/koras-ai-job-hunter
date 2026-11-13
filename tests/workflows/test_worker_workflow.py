@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -11,14 +12,17 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pytest
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.orm import Session
 
 from kajh_api.models import AuditEvent, Membership, Opportunity, WorkflowDecision, WorkflowRun, utcnow
 from kajh_domain import POLICY_VERSION
-from kajh_worker.config import session_factory
+from kajh_worker.config import checkpoint_url, session_factory
 from kajh_worker.ingestion import GRAPH_VERSION
-from kajh_worker.workflow import run_workflow, setup_checkpoints
+from kajh_worker.workflow import build_graph, run_workflow, setup_checkpoints
 
 pytestmark = pytest.mark.integration
 
@@ -41,7 +45,7 @@ def flow():
             run = WorkflowRun(workspace_id=opportunity.workspace_id, opportunity_id=opportunity.id,
                 thread_id="kajh-p1-test-" + uuid4().hex, graph_version=GRAPH_VERSION,
                 policy_version=POLICY_VERSION, status="test_pending", requested_by=owner.user_id,
-                budget={"paid_calls": 0, "limit": 0, **(budget or {})})
+                budget={"paid_calls": 0, "limit": 0, "opportunity_version": opportunity.version, **(budget or {})})
             db.add(run)
             db.flush()
             ids.append(run.id)
@@ -196,3 +200,83 @@ def test_worker_database_principal_cannot_forge_approval_or_api_identity(flow):
                        {"ws": "00000000-0000-0000-0000-000000000001", "run": run_id})
         assert "permission denied" in str(error.value).lower()
         db.rollback()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("graph_version", "incompatible-v2"), ("policy_version", "unknown-policy"),
+    ("run_id", "00000000-0000-0000-0000-000000000099"),
+    ("workspace_id", "00000000-0000-0000-0000-000000000002"), ("opportunity_version", -1), ("paid_calls", 1),
+    ("opportunity_version", True), ("opportunity_version", "matching_float"),
+])
+def test_persisted_checkpoint_metadata_is_checked_before_resume(flow, field, value):
+    engine, create, approve = flow
+    run_id = create()
+    assert asyncio.run(run_workflow(run_id)) == "waiting_review"
+    decision_id = approve(run_id)
+    with Session(engine) as db, db.begin():
+        run = db.get(WorkflowRun, run_id)
+        if value == "matching_float":
+            value = float(db.get(Opportunity, run.opportunity_id).version)
+        # Checkpointer3.2 keeps primitive state channels inline. Change only
+        # this owned test thread while preserving its pending human interrupt.
+        db.execute(text("UPDATE checkpoints.checkpoints SET checkpoint=jsonb_set(checkpoint,ARRAY['channel_values',:field],CAST(:value AS jsonb)) WHERE thread_id=:thread AND checkpoint_ns='' AND checkpoint_id=(SELECT max(checkpoint_id) FROM checkpoints.checkpoints WHERE thread_id=:thread AND checkpoint_ns='')"),
+            {"thread": run.thread_id, "field": field, "value": json.dumps(value)})
+    with pytest.raises(PermissionError, match="Checkpoint metadata"):
+        asyncio.run(run_workflow(run_id, decision_id))
+    with Session(engine) as db:
+        assert db.get(WorkflowDecision, decision_id).consumed is False
+        assert db.get(WorkflowRun, run_id).status == "waiting_review"
+
+
+@pytest.mark.parametrize("binding", [None, True, "1", -1])
+def test_missing_or_malformed_durable_content_binding_cannot_start(flow, binding):
+    _engine, create, _approve = flow
+    run_id = create(budget={"opportunity_version": binding})
+    with pytest.raises(PermissionError, match="content binding"):
+        asyncio.run(run_workflow(run_id))
+
+
+def test_disabled_crash_injection_cannot_consume_an_approval(flow, monkeypatch):
+    engine, create, approve = flow
+    monkeypatch.delenv("KAJH_WORKER_FAULT_INJECTION", raising=False)
+    run_id = create(budget={"mock_mode": "crash_after_consume"})
+    assert asyncio.run(run_workflow(run_id)) == "waiting_review"
+    decision_id = approve(run_id)
+    assert asyncio.run(run_workflow(run_id, decision_id)) == "error"
+    with Session(engine) as db:
+        assert db.get(WorkflowDecision, decision_id).consumed is False
+        assert not db.scalars(select(AuditEvent).where(AuditEvent.object_id == str(run_id),
+            AuditEvent.action == "workflow.local_review_consumed")).all()
+
+
+@pytest.mark.parametrize("key,value", [("paid_calls", False), ("paid_calls", 1), ("limit", False), ("limit", None)])
+def test_cost_budget_requires_explicit_integer_zero(flow, key, value):
+    _engine, create, _approve = flow
+    run_id = create(budget={key: value})
+    with pytest.raises(PermissionError, match="cost budget"):
+        asyncio.run(run_workflow(run_id))
+
+
+def test_terminal_checkpoint_cannot_report_completion_while_durable_run_waits_for_review(flow):
+    engine, create, _approve = flow
+    run_id = create()
+    assert asyncio.run(run_workflow(run_id)) == "waiting_review"
+    with Session(engine) as db:
+        thread_id = db.get(WorkflowRun, run_id).thread_id
+
+    async def forge_terminal():
+        async with await AsyncConnection.connect(checkpoint_url(), autocommit=True,
+                row_factory=dict_row, prepare_threshold=None) as connection:
+            await connection.execute("SET search_path TO checkpoints, public")
+            graph = build_graph(AsyncPostgresSaver(connection))
+            config = {"configurable": {"thread_id": thread_id}}
+            await graph.aupdate_state(config, {"status": "completed"}, as_node="finish")
+            assert not (await graph.aget_state(config)).next
+
+    asyncio.run(forge_terminal())
+    with pytest.raises(PermissionError, match="Terminal checkpoint"):
+        asyncio.run(run_workflow(run_id))
+    with Session(engine) as db:
+        assert db.get(WorkflowRun, run_id).status == "waiting_review"
+        assert not db.scalars(select(AuditEvent).where(AuditEvent.object_id == str(run_id),
+            AuditEvent.action == "workflow.completed")).all()

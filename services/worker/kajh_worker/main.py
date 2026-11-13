@@ -12,13 +12,14 @@ from sqlalchemy import select
 from kajh_api.models import WorkflowRun, utcnow
 
 from .config import session_factory
-from .ingestion import claim_job, fenced_job, finish_failure, ingest_job, purge_expired, reassess_workspace
+from .ingestion import claim_job, fenced_job, finish_failure, ingest_job, purge_expired, reassess_workspace, reconcile_workflow_bindings
 from .workflow import run_workflow, setup_checkpoints
 
 
 def run_once() -> bool:
     factory = session_factory()
     with factory() as db, db.begin():
+        reconcile_workflow_bindings(db)
         claimed = claim_job(db)
     if claimed:
         job_id, token = claimed
@@ -67,7 +68,7 @@ def run_once() -> bool:
         except Exception as error:
             with factory() as db, db.begin():
                 run = db.get(WorkflowRun, run_id)
-                if run:
+                if run and not run.restore_hold:
                     run.status, run.error = "error", type(error).__name__
             print(json.dumps({"event": "workflow.failed", "run_id": str(run_id), "error_type": type(error).__name__}), flush=True)
         return True

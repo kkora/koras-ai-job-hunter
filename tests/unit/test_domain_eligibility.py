@@ -153,3 +153,60 @@ def test_non_boolean_claim_does_not_pass_gate():
     item, vendor = base()
     item["facts"]["b2b_accepted"] = "yes"
     assert evaluate_eligibility(item, vendor, now=NOW)["status"] == "Unknown"
+
+
+@pytest.mark.parametrize("value", [False, float("inf"), float("nan")])
+def test_invalid_overlap_never_satisfies_zero_or_available_hours(value):
+    item, vendor = base()
+    item["facts"]["required_overlap_hours"] = value
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "timezone_overlap")["status"] == "Unknown"
+    item, vendor = base()
+    vendor["available_overlap_hours"] = value
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "timezone_overlap")["status"] == "Unknown"
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan")])
+def test_nonfinite_duration_and_attendance_are_unknown(value):
+    item, vendor = base()
+    item["facts"]["duration_months"] = value
+    vendor["max_duration_months"] = None
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "contract_duration")["status"] == "Unknown"
+    item["facts"].update(workplace_type="hybrid", onsite_country="US", onsite_days=value)
+    vendor["max_onsite_days"] = value
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "workplace")["status"] == "Unknown"
+
+
+@pytest.mark.parametrize("minimum,maximum", [(float("nan"), None), (10, 2), (-1, 12)])
+def test_invalid_vendor_duration_preferences_require_review(minimum, maximum):
+    item, vendor = base()
+    vendor.update(min_duration_months=minimum, max_duration_months=maximum)
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "contract_duration")["status"] == "Needs Review"
+
+
+def test_rate_minimum_cannot_be_compared_without_vendor_currency_and_unit():
+    item, vendor = base()
+    vendor["rate_preferences"] = {"minimum": 500}
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "compensation")["status"] == "Unknown"
+
+
+def test_malformed_country_claims_are_not_silently_filtered_to_a_pass():
+    item, vendor = base()
+    item["facts"]["eligible_vendor_countries"] = ["US", "??"]
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "vendor_jurisdiction")["status"] == "Unknown"
+    item["facts"]["delivery_countries"] = ["US", 12]
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "delivery_geography")["status"] == "Unknown"
+
+
+def test_structured_unknown_workplace_does_not_crash_qualification():
+    item, vendor = base()
+    item["facts"]["workplace_type"] = ["remote", "hybrid"]
+    assert rule(evaluate_eligibility(item, vendor, now=NOW), "workplace")["status"] == "Unknown"
+
+
+@pytest.mark.parametrize("field", ["b2b_accepted", "employee_only", "w2_only"])
+def test_conflicting_structured_boolean_claims_cannot_be_silently_qualified(field):
+    item, vendor = base()
+    item["terms"][field] = not item["facts"][field]
+    result = evaluate_eligibility(item, vendor, now=NOW)
+    assert result["status"] == "Needs Review"
+    assert rule(result, "contradictions")["evidence"][0]["value"][0]["field"] == field

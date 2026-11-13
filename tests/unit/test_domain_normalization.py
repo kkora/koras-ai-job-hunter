@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from kajh_domain import DisabledAdapter, SyntheticAdapter, dedupe_key, normalize_opportunity, validate_source_policy
+from kajh_domain import DisabledAdapter, SyntheticAdapter, dedupe_key, evaluate_eligibility, normalize_opportunity, synthetic_vendor_profile, validate_source_policy
 from kajh_domain.adapters import synthetic_opportunities, synthetic_permission
 from kajh_domain.policy import PolicyDenied
 
@@ -119,3 +119,77 @@ def test_ai_and_embedding_permissions_are_distinct_from_collection():
 def test_source_kill_switch_blocks_collection(source):
     with pytest.raises(PolicyDenied):
         validate_source_policy(source, synthetic_permission(NOW), now=NOW)
+
+
+def test_nested_invalid_deadline_is_not_reclassified_as_rolling():
+    raw = synthetic_opportunities(NOW)[0]
+    raw.pop("closing_at", None)
+    raw["facts"].update(closing_at="2026-12-01T12:00:00", no_closing_date=True)
+    result = normalize_opportunity(raw)
+    assert result["facts"]["deadline_timezone_unknown"] is True
+    assessment = evaluate_eligibility(result, synthetic_vendor_profile(), now=NOW)
+    assert assessment["status"] == "Unknown"
+
+
+def test_long_source_identities_remain_distinct_and_fit_storage():
+    raw = synthetic_opportunities(NOW)[0]
+    first = normalize_opportunity({**raw, "external_id": "x" * 500 + "A"})
+    second = normalize_opportunity({**raw, "external_id": "x" * 500 + "B"})
+    assert first["external_id"] != second["external_id"]
+    assert len(first["external_id"]) <= 200
+
+
+def test_case_distinct_requisition_ids_are_not_assumed_identical():
+    raw = synthetic_opportunities(NOW)[0]
+    assert dedupe_key(normalize_opportunity({**raw, "requisition_id": "Req-A"})) != dedupe_key(
+        normalize_opportunity({**raw, "requisition_id": "req-a"}))
+
+
+@pytest.mark.parametrize("value", [None, False, {"title": "invalid"}])
+def test_nontext_title_is_rejected(value):
+    raw = synthetic_opportunities(NOW)[0]
+    with pytest.raises(ValueError, match="title"):
+        normalize_opportunity({**raw, "title": value})
+
+
+@pytest.mark.parametrize("value", ["1e1000000", "1e-1000000"])
+def test_unbounded_numeric_exponents_remain_unknown_without_materialization(value):
+    raw = synthetic_opportunities(NOW)[0]
+    raw["terms"] = {**raw["terms"], "rate_min": value}
+    assert normalize_opportunity(raw)["terms"]["rate_min"] is None
+
+
+@pytest.mark.parametrize("change", [
+    {"revoked": None}, {"revoked": "false"}, {"revoked": 1}, {"revoked": 0},
+    {"approved": False}, {"status": "pending"}, {"status": "draft"},
+])
+def test_ambiguous_or_conflicting_approval_cannot_enable_collection(change):
+    permission = {**synthetic_permission(NOW), **change}
+    with pytest.raises(PolicyDenied):
+        validate_source_policy({"adapter_type": "synthetic", "enabled": True}, permission, now=NOW)
+
+
+@pytest.mark.parametrize("missing", [("revoked",), ("approved", "status")])
+def test_missing_revocation_or_affirmative_approval_cannot_enable_collection(missing):
+    permission = synthetic_permission(NOW)
+    for key in missing:
+        permission.pop(key)
+    with pytest.raises(PolicyDenied):
+        validate_source_policy({"adapter_type": "synthetic", "enabled": True}, permission, now=NOW)
+
+
+def test_normalization_preserves_conflicting_boolean_claims_for_review():
+    raw = synthetic_opportunities(NOW)[0]
+    raw["terms"]["b2b_accepted"] = False
+    normalized = normalize_opportunity(raw)
+    assert normalized["facts"]["contradictions"]
+    assert evaluate_eligibility(normalized, synthetic_vendor_profile(), now=NOW)["status"] == "Needs Review"
+
+
+def test_rate_normalization_preserves_digits_beyond_decimal_context_precision():
+    raw = synthetic_opportunities(NOW)[0]
+    raw["terms"] = {**raw["terms"], "rate_min": "12345678901234567890123456789.12500",
+                    "rate_max": "12345678901234567890123456790.12500"}
+    normalized = normalize_opportunity(raw)
+    assert normalized["terms"]["rate_min"] == "12345678901234567890123456789.125"
+    assert normalized["terms"]["rate_max"] == "12345678901234567890123456790.125"

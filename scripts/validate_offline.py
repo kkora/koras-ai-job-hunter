@@ -8,10 +8,11 @@ import httpx
 
 from bootstrap import load_env
 from local_runtime import assert_owned, compose, docker
-from validate_runtime import write_evidence
+from validate_runtime import require_validation_assertions, write_evidence
 
 
 def offline_probe() -> dict:
+    require_validation_assertions()
     env=load_env()
     project=env["KAJH_PROJECT"]
     for service in ("api","worker","auth","db"):

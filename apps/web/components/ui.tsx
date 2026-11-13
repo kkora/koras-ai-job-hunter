@@ -1,25 +1,26 @@
 "use client";
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { AlertCircle, ArrowRight, Check, ChevronRight, CircleHelp, LoaderCircle, Search, ShieldCheck, X } from "lucide-react";
 import { api, ApiError, type Eligibility } from "@/lib/api";
 
 export function useResource<T>(path: string, refresh = 0) {
-  const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState<ApiError | Error | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [resource, setResource] = useState<{ path: string; refresh: number; data: T | null; error: Error | null; loading: boolean } | null>(null);
   useEffect(() => {
     const controller = new AbortController();
     async function load() {
-      setLoading(true); setError(null);
-      try { const result = await api<T>(path, { signal: controller.signal }); setData(result); }
-      catch (failure) { if (!controller.signal.aborted) setError(failure instanceof Error ? failure : new Error("Unable to load this view.")); }
-      finally { if (!controller.signal.aborted) setLoading(false); }
+      try {
+        const data = await api<T>(path, { signal: controller.signal });
+        if (!controller.signal.aborted) setResource({ path, refresh, data, error: null, loading: false });
+      } catch (failure) {
+        if (!controller.signal.aborted) setResource({ path, refresh, data: null, error: failure instanceof Error ? failure : new Error("Unable to load this view."), loading: false });
+      }
     }
     void load();
     return () => controller.abort();
   }, [path, refresh]);
-  return { data, error, loading };
+  return resource?.path === path && resource.refresh === refresh ? resource : { data: null, error: null, loading: true };
 }
 
 export function StatusBadge({ status }: { status: Eligibility | string }) {
@@ -52,26 +53,39 @@ export function Notice({ children, kind = "info" }: { children: ReactNode; kind?
 }
 
 export function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+  const titleId = useId();
+  const modalRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   useEffect(() => { closeRef.current = onClose; }, [onClose]);
   useEffect(() => {
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const first = document.querySelector<HTMLElement>("[role='dialog'] button");
+    const background = Array.from(document.body.children).filter((element): element is HTMLElement => element instanceof HTMLElement && element !== modalRef.current);
+    const priorInert = background.map(element => element.inert);
+    background.forEach(element => { element.inert = true; });
+    const priorOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const first = modalRef.current?.querySelector<HTMLElement>("button");
     first?.focus();
     function onKey(event: KeyboardEvent) {
       if (event.key === "Escape") closeRef.current();
       if (event.key === "Tab") {
-        const dialog = document.querySelector("[role='dialog']");
-        const controls = Array.from(dialog?.querySelectorAll<HTMLElement>("button:not(:disabled), input, select, textarea, a[href]") ?? []);
+        const dialog = modalRef.current;
+        const controls = Array.from(dialog?.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled):not([type='hidden']), select:not(:disabled), textarea:not(:disabled), a[href]") ?? []).filter(element => element.tabIndex >= 0 && element.getClientRects().length > 0);
         const firstControl = controls[0], lastControl = controls.at(-1);
         if (event.shiftKey && document.activeElement === firstControl) { event.preventDefault(); lastControl?.focus(); }
         if (!event.shiftKey && document.activeElement === lastControl) { event.preventDefault(); firstControl?.focus(); }
       }
     }
     document.addEventListener("keydown", onKey);
-    return () => { document.removeEventListener("keydown", onKey); previous?.focus(); };
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      background.forEach((element, index) => { element.inert = priorInert[index]; });
+      document.body.style.overflow = priorOverflow;
+      if (previous?.isConnected) previous.focus();
+      else document.getElementById("main-content")?.focus();
+    };
   }, []);
-  return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-heading"><h2 id="modal-title">{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={20} /></button></div>{children}</section></div>;
+  return createPortal(<div className="modal-backdrop" ref={modalRef} onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId}><div className="modal-heading"><h2 id={titleId}>{title}</h2><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={20} /></button></div>{children}</section></div>, document.body);
 }
 
 export function TextLink({ children }: { children: ReactNode }) { return <span className="text-link">{children}<ArrowRight size={15} /></span>; }

@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { writeFile } from "node:fs/promises";
 
 const root = resolve(__dirname, "../..");
-const evidence = resolve(root, ".local/evidence");
+const evidence = resolve(root, process.env.KAJH_E2E_EVIDENCE_DIR ?? ".local/evidence");
 
 async function signIn(page: Page, role: "owner" | "reviewer" | "auditor" = "owner") {
   await page.goto("/login");

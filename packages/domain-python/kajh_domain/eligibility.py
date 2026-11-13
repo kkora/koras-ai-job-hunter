@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping
+from math import isfinite
+from typing import Any, Mapping, TypeGuard
+
+from .normalization import boolean_claim_conflicts
 
 POLICY_VERSION = "kajh-eligibility-1.0"
 ELIGIBLE = "Eligible"
@@ -16,7 +19,16 @@ REVIEW = "Needs Review"
 def _countries(value: Any) -> set[str]:
     if not isinstance(value, (list, tuple, set)):
         return set()
-    return {item.upper() for item in value if isinstance(item, str) and len(item) == 2}
+    if any(not isinstance(item, str) or len(item) != 2 or not item.isascii() or not item.isalpha() for item in value):
+        return set()
+    return {item.upper() for item in value}
+
+
+def _finite_number(value: Any) -> TypeGuard[int | float]:
+    try:
+        return type(value) in (int, float) and isfinite(value)
+    except OverflowError:
+        return False
 
 
 def evaluate_eligibility(
@@ -33,6 +45,10 @@ def evaluate_eligibility(
     record = dict(facts_or_record)
     facts = dict(record.get("facts") or record)
     terms = record.get("terms") or {}
+    conflicts = boolean_claim_conflicts(record, facts, terms)
+    if conflicts:
+        existing = facts.get("contradictions")
+        facts["contradictions"] = [*(existing if isinstance(existing, list) else []), *conflicts]
     for key, value in terms.items():
         facts.setdefault(key, value)
     profile = dict(vendor or {})
@@ -45,6 +61,8 @@ def evaluate_eligibility(
     delivery = _countries(profile.get("delivery_countries", profile.get("delivery_regions", [])))
     if country and isinstance(country, str):
         country = country.upper()
+    if not isinstance(country, str) or len(country) != 2 or not country.isascii() or not country.isalpha():
+        country = None
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("Eligibility evaluation time must have a time zone")
@@ -135,10 +153,10 @@ def evaluate_eligibility(
 
     overlap = facts.get("required_overlap_hours")
     available_overlap = profile.get("available_overlap_hours")
-    if overlap == 0:
+    if _finite_number(overlap) and overlap == 0:
         add("timezone_overlap", ELIGIBLE, "No mandatory overlap", ["required_overlap_hours"])
-    elif isinstance(overlap, (int, float)) and not isinstance(overlap, bool) and 0 < overlap <= 24:
-        if isinstance(available_overlap, (int, float)) and not isinstance(available_overlap, bool):
+    elif _finite_number(overlap) and 0 < overlap <= 24:
+        if _finite_number(available_overlap) and 0 <= available_overlap <= 24:
             add("timezone_overlap", ELIGIBLE if available_overlap >= overlap else INELIGIBLE,
                 "Required overlap compared with explicitly available overlap", ["required_overlap_hours"])
         else:
@@ -149,14 +167,13 @@ def evaluate_eligibility(
     workplace = facts.get("workplace_type")
     if workplace == "remote":
         add("workplace", ELIGIBLE, "Remote delivery; geography is checked separately", ["workplace_type"])
-    elif workplace in {"hybrid", "onsite"}:
+    elif isinstance(workplace, str) and workplace in {"hybrid", "onsite"}:
         onsite_country = facts.get("onsite_country")
         allowed_onsite = _countries(profile.get("onsite_countries"))
         onsite_days = facts.get("onsite_days")
         max_days = profile.get("max_onsite_days")
-        if (not onsite_country or not isinstance(onsite_days, (int, float))
-                or not isinstance(max_days, (int, float)) or isinstance(onsite_days, bool)
-                or isinstance(max_days, bool) or onsite_days < 0 or max_days < 0):
+        if (not onsite_country or not _finite_number(onsite_days)
+                or not _finite_number(max_days) or onsite_days < 0 or max_days < 0):
             add("workplace", UNKNOWN, "Mandatory onsite terms or availability missing", ["workplace_type", "onsite_country", "onsite_days"])
         else:
             passes = str(onsite_country).upper() in allowed_onsite and onsite_days <= max_days
@@ -181,10 +198,11 @@ def evaluate_eligibility(
         add("vendor_onboarding", UNKNOWN, "Vendor onboarding requirements missing", ["onboarding_required"])
 
     duration = facts.get("duration_months")
-    if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0:
+    if _finite_number(duration) and duration > 0:
         minimum = profile.get("min_duration_months", 0)
         maximum = profile.get("max_duration_months")
-        if type(minimum) not in (int, float) or (maximum is not None and type(maximum) not in (int, float)):
+        if (not _finite_number(minimum) or minimum < 0 or
+                (maximum is not None and (not _finite_number(maximum) or maximum < minimum))):
             add("contract_duration", REVIEW, "Vendor duration preferences are malformed", ["duration_months"])
         else:
             passes = duration >= minimum and (maximum is None or duration <= maximum)
@@ -212,9 +230,17 @@ def evaluate_eligibility(
                 rate_pref["minimum"] = profile["minimum_rate"]
             if profile.get("rate_unit") is not None:
                 rate_pref["unit"] = profile["rate_unit"]
-            if rate_pref.get("currency") and (rate_pref.get("currency") != currency or rate_pref.get("unit", rate_pref.get("rate_unit")) != unit):
+            preference_minimum = rate_pref.get("minimum")
+            preference_currency = rate_pref.get("currency")
+            preference_unit = rate_pref.get("unit", rate_pref.get("rate_unit"))
+            if preference_minimum is not None:
+                preference_minimum = Decimal(str(preference_minimum))
+                if not preference_minimum.is_finite() or preference_minimum < 0:
+                    raise InvalidOperation
+            if ((preference_minimum is not None and (not preference_currency or not preference_unit)) or
+                    (preference_currency and (preference_currency != currency or preference_unit != unit))):
                 add("compensation", UNKNOWN, "Rate currencies/units cannot be compared without an approved conversion", ["currency", "rate_unit"])
-            elif rate_pref.get("minimum") is not None and high < Decimal(str(rate_pref["minimum"])):
+            elif preference_minimum is not None and high < preference_minimum:
                 add("compensation", INELIGIBLE, "Entire disclosed rate is below configured vendor minimum", ["rate_min", "rate_max", "currency", "rate_unit"])
             else:
                 add("compensation", ELIGIBLE, "Explicit rates and units are valid and comparable", ["rate_min", "rate_max", "currency", "rate_unit"])

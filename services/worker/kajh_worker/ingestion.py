@@ -14,7 +14,7 @@ from kajh_api.models import (
     AuditEvent, EligibilityEvidence, Job, Opportunity, OpportunitySource,
     RawObservation, Source, SourceRun, VendorProfile, WorkflowRun, utcnow,
 )
-from kajh_domain import POLICY_VERSION, SyntheticAdapter, dedupe_key, evaluate_eligibility, normalize_opportunity, validate_source_policy
+from kajh_domain import POLICY_VERSION, SyntheticAdapter, canonical_hash, dedupe_key, evaluate_eligibility, normalize_opportunity, validate_source_policy, vendor_hash
 
 GRAPH_VERSION = "p1-v1"
 
@@ -22,6 +22,101 @@ GRAPH_VERSION = "p1-v1"
 def audit(db: Session, workspace_id: UUID, action: str, object_type: str, object_id: Any, details: dict | None = None):
     db.add(AuditEvent(workspace_id=workspace_id, actor="worker:synthetic", action=action,
                       object_type=object_type, object_id=str(object_id), details=details or {}))
+
+
+PENDING_WORKFLOW_STATUSES = {"queued", "running", "waiting_review", "needs_review", "interrupted", "resume_requested", "approved", "test_pending"}
+
+
+def hold_pending_workflows(db: Session, opportunity: Opportunity, reason: str):
+    for run in db.scalars(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity.id,
+            WorkflowRun.restore_hold.is_(False), WorkflowRun.status.in_(PENDING_WORKFLOW_STATUSES))):
+        run.restore_hold, run.status, run.updated_at = True, reason, utcnow()
+        run.version += 1
+
+
+def new_workflow(opportunity: Opportunity, *, job_id: UUID | None = None,
+                 requested_by: UUID | None = None) -> WorkflowRun:
+    return WorkflowRun(workspace_id=opportunity.workspace_id, opportunity_id=opportunity.id,
+        job_id=job_id, requested_by=requested_by, thread_id=f"kajh-p1-{uuid4()}", graph_version=GRAPH_VERSION,
+        policy_version=POLICY_VERSION, status="queued",
+        budget={"paid_calls": 0, "limit": 0, "opportunity_version": opportunity.version})
+
+
+def bound_workflow(db: Session, opportunity: Opportunity) -> WorkflowRun | None:
+    for run in db.scalars(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity.id,
+            WorkflowRun.restore_hold.is_(False), WorkflowRun.graph_version == GRAPH_VERSION,
+            WorkflowRun.policy_version == POLICY_VERSION)):
+        bound = run.budget.get("opportunity_version")
+        if type(bound) is int and bound == opportunity.version:
+            return run
+    return None
+
+
+def validate_provenance(db: Session, opportunity: Opportunity, *, lock: bool = False):
+    if lock:
+        # Match the database review gate: sources, observations, opportunity,
+        # then workflow. Registry locks also prevent ingestion adding a new link.
+        list(db.scalars(select(Source).where(Source.workspace_id == opportunity.workspace_id)
+            .order_by(Source.id).with_for_update(read=True).execution_options(populate_existing=True)))
+        list(db.scalars(select(RawObservation).join(OpportunitySource,
+            OpportunitySource.observation_id == RawObservation.id)
+            .where(OpportunitySource.opportunity_id == opportunity.id)
+            .order_by(RawObservation.id).with_for_update(read=True, of=RawObservation)
+            .execution_options(populate_existing=True)))
+    query = (select(Source, RawObservation)
+        .join(OpportunitySource, Source.id == OpportunitySource.source_id)
+        .join(RawObservation, RawObservation.id == OpportunitySource.observation_id)
+        .where(OpportunitySource.opportunity_id == opportunity.id))
+    provenance = list(db.execute(query.execution_options(populate_existing=True)))
+    if not provenance:
+        raise PermissionError("A permitted provenance source is required")
+    for source, observation in provenance:
+        if observation.expires_at <= utcnow():
+            raise PermissionError("Current provenance evidence must be reconciled after expiry")
+        try:
+            validate_source_policy({"adapter_type": source.adapter_type, "enabled": source.enabled,
+                "killed": source.killed, "permission": source.permission})
+        except ValueError:
+            raise PermissionError("Current provenance permission must be reconciled") from None
+
+
+def reconcile_workflow_bindings(db: Session) -> int:
+    """Hold legacy/stale pending graphs; never assign them an assumed version."""
+    replaced = 0
+    statuses = PENDING_WORKFLOW_STATUSES - {"test_pending"}
+    candidates = list(db.scalars(select(WorkflowRun).where(WorkflowRun.restore_hold.is_(False),
+        WorkflowRun.status.in_(statuses)).order_by(WorkflowRun.id)))
+    for candidate in candidates:
+        opportunity = db.get(Opportunity, candidate.opportunity_id)
+        if not opportunity:
+            continue
+        permitted = True
+        try:
+            validate_provenance(db, opportunity, lock=True)
+        except PermissionError:
+            permitted = False
+        opportunity = db.scalar(select(Opportunity).where(Opportunity.id == opportunity.id)
+            .with_for_update().execution_options(populate_existing=True))
+        run = db.scalar(select(WorkflowRun).where(WorkflowRun.id == candidate.id)
+            .with_for_update(skip_locked=True).execution_options(populate_existing=True))
+        if not run or run.restore_hold or run.status not in statuses or opportunity is None:
+            continue
+        bound = run.budget.get("opportunity_version")
+        if type(bound) is int and bound == opportunity.version:
+            continue
+        run.restore_hold, run.status, run.updated_at = True, "content_binding_required", utcnow()
+        run.version += 1
+        if opportunity.lifecycle != "open" or (opportunity.expires_at and opportunity.expires_at <= utcnow()):
+            continue
+        if not permitted:
+            continue
+        if bound_workflow(db, opportunity) is None:
+            db.add(new_workflow(opportunity, requested_by=run.requested_by))
+            audit(db, run.workspace_id, "workflow.binding_replaced", "workflow", run.id,
+                  {"opportunity_version": opportunity.version})
+            db.flush()
+            replaced += 1
+    return replaced
 
 
 def claim_job(db: Session, *, lease_seconds: int = 60) -> tuple[UUID, UUID] | None:
@@ -56,15 +151,6 @@ def fenced_job(db: Session, job_id: UUID, token: UUID) -> Job:
     return job
 
 
-def canonical_hash(record: dict[str, Any]) -> str:
-    body = {key: record.get(key) for key in ("title", "description", "employer", "category", "skills", "facts", "terms", "requisition_id")}
-    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
-
-
-def vendor_hash(profile: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(profile, sort_keys=True, default=str).encode()).hexdigest()
-
-
 def persist_record(db: Session, source: Source, run: SourceRun, raw: dict[str, Any], vendor: dict, retention_days: int) -> tuple[Opportunity, bool]:
     now = utcnow()
     record = normalize_opportunity(raw, str(source.id), observed_at=now)
@@ -92,9 +178,19 @@ def persist_record(db: Session, source: Source, run: SourceRun, raw: dict[str, A
     opportunity = db.get(Opportunity, link.opportunity_id) if link else None
     if opportunity is None and identity:
         opportunity = db.scalar(select(Opportunity).where(
-            Opportunity.workspace_id == source.workspace_id, Opportunity.dedupe_key == identity,
+            Opportunity.workspace_id == source.workspace_id,
+            Opportunity.dedupe_key.is_not(None),
+            Opportunity.organization_domain == record["employer"].get("domain"),
+            Opportunity.facts["requisition_id"].astext == record.get("requisition_id"),
+            Opportunity.category == record["category"],
             Opportunity.merged_into.is_(None), Opportunity.lifecycle != "purged",
         ).order_by(Opportunity.first_seen).with_for_update().limit(1))
+    if (opportunity is not None and opportunity.dedupe_key is not None and identity and
+            opportunity.organization_domain == record["employer"].get("domain") and
+            opportunity.facts.get("requisition_id") == record.get("requisition_id")):
+        # Preserve strict identity for old hashes without re-merging an Owner
+        # split (which deliberately clears the key), or folding case-distinct IDs.
+        opportunity.dedupe_key = identity
     new = opportunity is None
     current_hash = canonical_hash(record)
     changed = opportunity is None or opportunity.facts.get("_canonical_hash") != current_hash or opportunity.facts.get("_vendor_profile_hash") != vendor_hash(vendor)
@@ -121,6 +217,7 @@ def persist_record(db: Session, source: Source, run: SourceRun, raw: dict[str, A
         opportunity.category, opportunity.eligibility = record["category"], assessment["status"]
         opportunity.workplace = facts.get("workplace_type", "Unknown")
         opportunity.version += 1
+        hold_pending_workflows(db, opportunity, "content_changed")
     assert opportunity is not None
     opportunity.last_seen = now
     opportunity.expires_at = max(opportunity.expires_at or now, observation.expires_at)
@@ -205,12 +302,12 @@ def ingest_job(db: Session, job_id: UUID, lease_token: UUID) -> dict[str, Any]:
     source_run.cursor_after, source_run.counts = cursor, counts
     run_ids = []
     for opportunity_id in sorted(opportunity_ids, key=str):
-        existing = db.scalar(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity_id,
-            WorkflowRun.graph_version == GRAPH_VERSION).limit(1))
+        current_opportunity = db.get(Opportunity, opportunity_id)
+        if current_opportunity is None:
+            raise ValueError("Ingested opportunity is unavailable")
+        existing = bound_workflow(db, current_opportunity)
         if not existing:
-            workflow = WorkflowRun(workspace_id=source.workspace_id, opportunity_id=opportunity_id,
-                job_id=job.id, thread_id=f"kajh-p1-{uuid4()}", graph_version=GRAPH_VERSION,
-                policy_version=POLICY_VERSION, status="queued", budget={"paid_calls": 0, "limit": 0})
+            workflow = new_workflow(current_opportunity, job_id=job.id)
             db.add(workflow)
             db.flush()
             run_ids.append(str(workflow.id))
@@ -319,9 +416,7 @@ def purge_expired(db: Session) -> dict[str, int]:
                     rule=rule["rule_id"], outcome=rule["status"], details={**rule,
                     "content_version": opportunity.version, "policy_version": POLICY_VERSION,
                     "source_id": str(source.id), "observation_id": str(observation.id)}))
-            db.add(WorkflowRun(workspace_id=opportunity.workspace_id, opportunity_id=opportunity.id,
-                thread_id=f"kajh-p1-{uuid4()}", graph_version=GRAPH_VERSION, policy_version=POLICY_VERSION,
-                budget={"paid_calls": 0, "limit": 0}, status="queued"))
+            db.add(new_workflow(opportunity))
             audit(db, opportunity.workspace_id, "opportunity.retention_rebuilt", "opportunity", opportunity.id,
                   {"source_id": str(source.id), "version": opportunity.version})
     return {"observations": len(observations), "opportunities": purged}
@@ -351,12 +446,8 @@ def reassess_workspace(db: Session, workspace_id: UUID) -> dict[str, int]:
                 rule=rule["rule_id"], outcome=rule["status"], details={**rule,
                 "content_version": opportunity.version, "policy_version": POLICY_VERSION,
                 "vendor_profile_version": vendor.version if vendor else None}))
-        for run in db.scalars(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity.id,
-                WorkflowRun.status.in_(["waiting_review", "resume_requested", "queued"]))):
-            run.restore_hold, run.status = True, "profile_changed"
-        db.add(WorkflowRun(workspace_id=workspace_id, opportunity_id=opportunity.id,
-            thread_id=f"kajh-p1-{uuid4()}", graph_version=GRAPH_VERSION, policy_version=POLICY_VERSION,
-            status="queued", budget={"paid_calls": 0, "limit": 0}))
+        hold_pending_workflows(db, opportunity, "profile_changed")
+        db.add(new_workflow(opportunity))
         reassessed += 1
     audit(db, workspace_id, "workspace.reassessed", "vendor_profile", vendor.id if vendor else "none",
           {"opportunities": reassessed, "profile_version": vendor.version if vendor else None})

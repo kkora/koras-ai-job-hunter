@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import os
 from datetime import timedelta
 from uuid import UUID, uuid4
@@ -15,11 +16,12 @@ from kajh_api.models import (
     AuditEvent, EligibilityEvidence, Job, Membership, Opportunity, OpportunitySource, RawObservation,
     SavedOpportunity, Source, SourcePermission, SourceRun, WorkflowDecision, WorkflowRun, utcnow,
 )
-from kajh_domain import POLICY_VERSION, synthetic_permission, synthetic_vendor_profile
+from kajh_domain import POLICY_VERSION, SyntheticAdapter, synthetic_permission, synthetic_vendor_profile
+from kajh_domain.adapters import AdapterPage
 from kajh_domain.policy import PolicyDenied
 from kajh_worker.config import session_factory
-from kajh_worker.ingestion import GRAPH_VERSION, fenced_job, finish_failure, ingest_job, persist_record, purge_expired, reassess_workspace
-from kajh_worker.workflow import current
+from kajh_worker.ingestion import GRAPH_VERSION, fenced_job, finish_failure, ingest_job, persist_record, purge_expired, reassess_workspace, reconcile_workflow_bindings
+from kajh_worker.workflow import current, finish, validate
 
 pytestmark = pytest.mark.integration
 WORKSPACE = UUID("00000000-0000-0000-0000-000000000001")
@@ -300,7 +302,7 @@ def test_database_decision_gate_rechecks_revocation_at_atomic_consumption(lab):
         run = WorkflowRun(workspace_id=WORKSPACE, opportunity_id=opportunity.id,
             thread_id="kajh-p1-test-" + uuid4().hex, graph_version=GRAPH_VERSION,
             policy_version=POLICY_VERSION, status="waiting_review", requested_by=owner.user_id,
-            budget={"paid_calls": 0, "limit": 0})
+            budget={"paid_calls": 0, "limit": 0, "opportunity_version": opportunity.version})
         db.add(run)
         db.flush()
         digest = hashlib.sha256(f"{run.thread_id}:{opportunity.version}:review".encode()).hexdigest()
@@ -362,7 +364,8 @@ def test_workflow_processing_denies_any_invalid_current_provenance_link(lab, inv
             OpportunitySource.source_id == first, Opportunity.eligibility == "Unknown"))
         run = WorkflowRun(workspace_id=WORKSPACE, opportunity_id=opportunity.id,
             thread_id="kajh-p1-test-" + uuid4().hex, graph_version=GRAPH_VERSION,
-            policy_version=POLICY_VERSION, status="test_pending", budget={"paid_calls": 0, "limit": 0})
+            policy_version=POLICY_VERSION, status="test_pending",
+            budget={"paid_calls": 0, "limit": 0, "opportunity_version": opportunity.version})
         db.add(run)
         db.flush()
         run_id = run.id
@@ -384,3 +387,170 @@ def test_workflow_processing_denies_any_invalid_current_provenance_link(lab, inv
         current(run_id)
     with Session(admin) as db:
         assert db.get(WorkflowRun, run_id).budget.get("mock_attempts", 0) == 0
+
+
+def test_refreshed_canonical_holds_old_workflow_and_queues_one_bound_replacement(lab, monkeypatch):
+    admin, source, leased_job, ingest = lab
+    source_id = source()
+    job_id, token = leased_job(source_id)
+    ingest(job_id, token)
+    with Session(admin) as db:
+        link = db.scalar(select(OpportunitySource).join(Opportunity,
+            Opportunity.id == OpportunitySource.opportunity_id).where(
+            OpportunitySource.source_id == source_id, Opportunity.eligibility == "Unknown"))
+        opportunity_id, external_id = link.opportunity_id, link.external_id
+        old = db.scalar(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity_id))
+        old_id, old_version = old.id, db.get(Opportunity, opportunity_id).version
+    original = SyntheticAdapter.collect
+
+    def refreshed(adapter, cursor=None, *, page_size=4):
+        page = original(adapter, cursor, page_size=page_size)
+        return AdapterPage([{**raw, "description": raw["description"] + " Revised synthetic terms."}
+            if raw["external_id"] == external_id else raw for raw in page.items], page.next_cursor, page.exhausted)
+
+    monkeypatch.setattr(SyntheticAdapter, "collect", refreshed)
+    with Session(admin) as db, db.begin():
+        db.get(Source, source_id).cursor = None
+    job_id, token = leased_job(source_id)
+    result = ingest(job_id, token)
+    assert len(result["workflow_run_ids"]) == 1
+    with Session(admin) as db:
+        opportunity = db.get(Opportunity, opportunity_id)
+        assert opportunity.version == old_version + 1
+        assert db.get(WorkflowRun, old_id).restore_hold is True
+        assert db.get(WorkflowRun, old_id).status == "content_changed"
+        replacement = db.get(WorkflowRun, UUID(result["workflow_run_ids"][0]))
+        assert replacement.budget["opportunity_version"] == opportunity.version
+    with pytest.raises(PermissionError):
+        current(old_id)
+    with Session(admin) as db, db.begin():
+        db.get(Source, source_id).cursor = None
+    replay, token = leased_job(source_id)
+    assert ingest(replay, token)["workflow_run_ids"] == []
+
+
+def test_strict_requisition_identity_reconciles_legacy_hash_without_duplicate_canonical(lab):
+    admin, source, leased_job, ingest = lab
+    first, second = source(), source()
+    job_id, token = leased_job(first)
+    ingest(job_id, token)
+    with Session(admin) as db, db.begin():
+        ids = set(db.scalars(select(OpportunitySource.opportunity_id).where(OpportunitySource.source_id == first)))
+        for opportunity in db.scalars(select(Opportunity).where(Opportunity.id.in_(ids))):
+            old_identity = f"{opportunity.organization_domain}|{opportunity.facts['requisition_id'].casefold()}|{opportunity.category}"
+            opportunity.dedupe_key = hashlib.sha256(old_identity.encode()).hexdigest()
+    job_id, token = leased_job(second)
+    assert ingest(job_id, token)["created"] == 0
+    with Session(admin) as db:
+        assert set(db.scalars(select(OpportunitySource.opportunity_id).where(OpportunitySource.source_id == second))) == ids
+
+
+@pytest.mark.parametrize("revoked", [False, True])
+def test_legacy_binding_replacement_requires_current_permitted_evidence(lab, revoked):
+    admin, source, leased_job, ingest = lab
+    source_id = source()
+    job_id, token = leased_job(source_id)
+    ingest(job_id, token)
+    with Session(admin) as db, db.begin():
+        opportunity_id = db.scalar(select(OpportunitySource.opportunity_id).join(Opportunity,
+            Opportunity.id == OpportunitySource.opportunity_id).where(
+            OpportunitySource.source_id == source_id, Opportunity.lifecycle == "open"))
+        if revoked:
+            source_row = db.get(Source, source_id)
+            source_row.permission = {**source_row.permission, "revoked": True}
+    # Keep this transition and any other legacy workspace repairs uncommitted;
+    # a background service must not race this deliberately malformed fixture.
+    with session_factory()() as db, db.begin():
+        for old in db.scalars(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity_id)):
+            old.restore_hold = True
+        legacy = WorkflowRun(workspace_id=WORKSPACE, opportunity_id=opportunity_id,
+            thread_id="kajh-p1-test-" + uuid4().hex, graph_version=GRAPH_VERSION,
+            policy_version=POLICY_VERSION, status="waiting_review", budget={"paid_calls": 0, "limit": 0})
+        history = WorkflowRun(workspace_id=WORKSPACE, opportunity_id=opportunity_id,
+            thread_id="kajh-p1-test-" + uuid4().hex, graph_version=GRAPH_VERSION,
+            policy_version=POLICY_VERSION, status="completed", budget={"paid_calls": 0, "limit": 0})
+        db.add_all([legacy, history])
+        db.flush()
+        reconcile_workflow_bindings(db)
+        db.flush()
+        assert legacy.restore_hold is True
+        assert legacy.status == "content_binding_required"
+        assert history.status == "completed" and not history.restore_hold
+        active = list(db.scalars(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity_id,
+            WorkflowRun.restore_hold.is_(False), WorkflowRun.status == "queued")))
+        assert len(active) == (0 if revoked else 1)
+        if active:
+            assert active[0].budget["opportunity_version"] == db.get(Opportunity, opportunity_id).version
+        db.rollback()
+
+
+def test_atomic_finish_cannot_overwrite_a_hold_added_after_initial_read(lab, monkeypatch):
+    admin, source, leased_job, ingest = lab
+    source_id = source()
+    job_id, token = leased_job(source_id)
+    ingest(job_id, token)
+    with Session(admin) as db:
+        opportunity_id = db.scalar(select(OpportunitySource.opportunity_id).join(Opportunity,
+            Opportunity.id == OpportunitySource.opportunity_id).where(
+            OpportunitySource.source_id == source_id, Opportunity.lifecycle == "open"))
+        run = db.scalar(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity_id))
+        run_id, version = run.id, db.get(Opportunity, opportunity_id).version
+    actual_current = current
+
+    def concurrent_hold(identifier):
+        snapshot = actual_current(identifier)
+        with Session(admin) as db, db.begin():
+            row = db.get(WorkflowRun, identifier)
+            row.restore_hold, row.status = True, "content_changed"
+        return snapshot
+
+    monkeypatch.setattr("kajh_worker.workflow.current", concurrent_hold)
+    with pytest.raises(PermissionError, match="held"):
+        asyncio.run(finish({"run_id": str(run_id), "opportunity_version": version, "status": "classified"}))
+    with Session(admin) as db:
+        assert db.get(WorkflowRun, run_id).status == "content_changed"
+        assert not db.scalars(select(AuditEvent).where(AuditEvent.object_id == str(run_id),
+            AuditEvent.action == "workflow.completed")).all()
+
+
+@pytest.mark.parametrize("forged_status", ["classified", "approved"])
+def test_checkpoint_state_cannot_complete_review_required_content_without_consumed_decision(lab, forged_status):
+    admin, source, leased_job, ingest = lab
+    source_id = source()
+    job_id, token = leased_job(source_id)
+    ingest(job_id, token)
+    with Session(admin) as db:
+        opportunity = db.scalar(select(Opportunity).join(OpportunitySource,
+            Opportunity.id == OpportunitySource.opportunity_id).where(
+            OpportunitySource.source_id == source_id, Opportunity.eligibility == "Unknown"))
+        run = db.scalar(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity.id))
+        run_id, version = run.id, opportunity.version
+    with pytest.raises(PermissionError, match="trusted consumed review"):
+        asyncio.run(finish({"run_id": str(run_id), "opportunity_version": version, "status": forged_status}))
+    with Session(admin) as db:
+        assert db.get(WorkflowRun, run_id).status == "test_pending"
+        assert not db.scalars(select(AuditEvent).where(AuditEvent.object_id == str(run_id),
+            AuditEvent.action == "workflow.completed")).all()
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0])
+def test_node_validation_and_finish_reject_coercible_content_version_types(lab, invalid_version):
+    admin, source, leased_job, ingest = lab
+    source_id = source()
+    job_id, token = leased_job(source_id)
+    ingest(job_id, token)
+    with Session(admin) as db:
+        opportunity = db.scalar(select(Opportunity).join(OpportunitySource,
+            Opportunity.id == OpportunitySource.opportunity_id).where(
+            OpportunitySource.source_id == source_id, Opportunity.eligibility == "Eligible"))
+        assert opportunity.version == 1
+        run = db.scalar(select(WorkflowRun).where(WorkflowRun.opportunity_id == opportunity.id))
+        run_id = run.id
+    state = {"run_id": str(run_id), "graph_version": GRAPH_VERSION, "policy_version": POLICY_VERSION,
+             "opportunity_version": invalid_version, "status": "classified", "paid_calls": 0}
+    with pytest.raises(PermissionError, match="content version"):
+        asyncio.run(validate(state))
+    with pytest.raises(PermissionError, match="content version"):
+        asyncio.run(finish(state))
+    with Session(admin) as db:
+        assert db.get(WorkflowRun, run_id).status == "test_pending"

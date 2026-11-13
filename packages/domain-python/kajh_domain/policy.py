@@ -18,11 +18,14 @@ def validate_source_policy(
     adapter = source.get("adapter_type", source.get("type"))
     if adapter != "synthetic":
         raise PolicyDenied("Real source activation is not authorized in P1")
-    if source.get("enabled") is not True or source.get("killed") is True:
+    if source.get("enabled") is not True or source.get("killed", False) is not False:
         raise PolicyDenied("Source is disabled or its kill switch is active")
     policy = dict(permission if permission is not None else source.get("permission") or source)
-    if policy.get("revoked") is True:
-        raise PolicyDenied("Source permission has been revoked")
+    if policy.get("revoked") is not False:
+        raise PolicyDenied("Source permission revocation state is not explicitly clear")
+    if (("approved" in policy and policy["approved"] is not True) or
+            ("status" in policy and policy["status"] != "approved")):
+        raise PolicyDenied("Source approval evidence is contradictory or incomplete")
     if policy.get("approved") is not True and policy.get("status") != "approved":
         raise PolicyDenied("Source permission is not approved")
     expiry = policy.get("expires_at")

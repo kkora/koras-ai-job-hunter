@@ -1,5 +1,5 @@
 import { defineConfig } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const root = resolve(__dirname, "../..");
@@ -11,15 +11,26 @@ for (const line of readFileSync(resolve(root, ".local/env"), "utf8").split(/\r?\
   }
 }
 
+const evidenceRoot = resolve(root, ".local/evidence");
+mkdirSync(evidenceRoot, { recursive: true, mode: 0o700 });
+const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
+const evidence = process.env.KAJH_E2E_EVIDENCE_DIR
+  ? resolve(root, process.env.KAJH_E2E_EVIDENCE_DIR)
+  : mkdtempSync(resolve(evidenceRoot, `playwright-${timestamp}-${process.pid}-`));
+mkdirSync(evidence, { recursive: true, mode: 0o700 });
+// Workers and test modules share the runner's directory, rather than creating
+// their own directories when the configuration is evaluated again.
+process.env.KAJH_E2E_EVIDENCE_DIR = evidence;
+
 export default defineConfig({
   testDir: resolve(root, "tests/e2e"),
-  outputDir: resolve(root, ".local/evidence/playwright-artifacts"),
+  outputDir: resolve(evidence, "playwright-artifacts"),
   timeout: 45_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,
   workers: 1,
   retries: 0,
-  reporter: [["list"], ["json", { outputFile: resolve(root, ".local/evidence/playwright-results.json") }]],
+  reporter: [["list"], ["json", { outputFile: resolve(evidence, "playwright-results.json") }]],
   use: {
     baseURL: "http://127.0.0.1:3210",
     viewport: { width: 1440, height: 1000 },

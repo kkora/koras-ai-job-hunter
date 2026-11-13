@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Input(BaseModel):
@@ -9,8 +9,14 @@ class Input(BaseModel):
 
 
 class Login(Input):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=1, max_length=200)
+
+    @field_validator("email")
+    @classmethod
+    def normalized_email(cls, value: str) -> str:
+        return value.strip()
 
 
 class ReviewInput(Input):
@@ -55,6 +61,11 @@ class MergeInput(Input):
     reason: str = Field(min_length=5, max_length=2000)
 
 
+class UnmergeInput(Input):
+    version: int = Field(ge=1)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
 class SplitSourceInput(Input):
     version: int = Field(ge=1)
     source_link_id: str
@@ -63,7 +74,7 @@ class SplitSourceInput(Input):
 
 def bounded_object(value: dict[str, Any]) -> dict[str, Any]:
     import json
-    if len(json.dumps(value)) > 64_000:
+    if len(json.dumps(value, allow_nan=False)) > 64_000:
         raise ValueError("Configuration exceeds the 64 KB limit")
     forbidden = {"password", "api_key", "access_token", "refresh_token", "service_role_key", "secret"}
     def visit(item: Any, depth: int = 0) -> None:

@@ -60,9 +60,9 @@ function ProfileEditor({ profile, onClose, onSaved }: { profile: SearchProfile |
   const [rate, setRate] = useState(str(profile?.filters.minimum_rate, ""));
   const [currency, setCurrency] = useState(str(profile?.filters.currency, "USD"));
   const [rateUnit, setRateUnit] = useState(str(profile?.filters.rate_unit, "hour"));
-  const [excludedTypes, setExcludedTypes] = useState(array(profile?.filters.excluded_employment_types).join(", ") || "W2-only, Employee-only");
+  const [excludedTypes, setExcludedTypes] = useState(profile ? array(profile.filters.excluded_employment_types).join(", ") : "W2-only, Employee-only");
   const [aliases, setAliases] = useState(JSON.stringify(object(profile?.filters.skill_aliases), null, 2));
-  const [seniority, setSeniority] = useState(array(profile?.filters.seniority).join(", ") || "Architect, Lead");
+  const [seniority, setSeniority] = useState(profile ? array(profile.filters.seniority).join(", ") : "Architect, Lead");
   const [b2b, setB2b] = useState(profile?.filters.b2b_required !== false);
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
   async function submit(event: FormEvent) {

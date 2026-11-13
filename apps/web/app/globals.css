@@ -196,7 +196,7 @@ small{font-size:11px}
 @keyframes shimmer{to{background-position:-200%}}
 .error-state{display:flex;align-items:flex-start;gap:12px;background:#fff7f3;border:1px solid #f0d8cb;border-radius:9px;padding:20px;color:#a36b51;margin:15px}
 .error-state strong{font-size:13px;color:#885e4a}.error-state p{font-size:11px;margin:5px 0}.error-state .button{margin-left:auto}
-.notice{display:flex;align-items:flex-start;gap:10px;padding:13px 15px;border-radius:7px;margin-bottom:20px;font-size:11px;line-height:1.8;border:1px solid #dce8dd;background:#f2f7f1;color:#5b7955}
+.notice{display:flex;align-items:flex-start;gap:10px;padding:13px 15px;border-radius:7px;margin-bottom:20px;font-size:11px;line-height:1.8;border:1px solid #dce8dd;background:#f2f7f1;color:#48683f}
 .notice>svg{flex-shrink:0;margin-top:2px}
 .notice-warning{background:#fff9ec;border-color:#eddfbf;color:#927539}
 .notice-success{background:#edf8f1;border-color:#cde8d6;color:#397856}

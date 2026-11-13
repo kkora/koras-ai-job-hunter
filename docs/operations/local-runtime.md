@@ -20,6 +20,8 @@ If GoTrue stops, new login fails with `AUTH_UNAVAILABLE` (503). Existing signed 
 
 The P1 backup scope is the PostgreSQL database. There are no uploaded objects or storage service in P1. Future object bytes, external search indexes, cryptographic keys and cross-system backup consistency require a separate design and validation. Backups/checkpoints of real source content also require explicit source permissions under E-02.
 
+Validation commands require Python assertions: `-O` or `PYTHONOPTIMIZE` fails before runtime state is touched. Evidence JSON is created exclusively with private file permissions; reruns preserve existing artifacts and return a unique `evidence_file`. Backup cleanup removes only the archive created by that invocation, and primary-service recovery also covers a partially failed quiesce operation. Lifecycle commands reject unrecognized arguments before any action; only `test` forwards extra pytest arguments.
+
 ## Troubleshooting
 
 - Web log: `.local/logs/web.log`; generated artifacts: `.local/evidence/`.

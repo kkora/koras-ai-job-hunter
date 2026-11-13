@@ -146,3 +146,33 @@ def test_request_logger_emits_json_without_credentials_or_queries():
         assert secret not in output.getvalue()
     finally:
         handler.setStream(previous)
+
+
+def test_authentication_does_not_strip_password_whitespace():
+    with TestClient(app, base_url=ORIGIN) as client:
+        for value in (" " + os.environ["OWNER_PASSWORD"], os.environ["OWNER_PASSWORD"] + " "):
+            response = client.post("/api/v1/auth/login", json={"email": "owner@kajh.invalid", "password": value}, headers={"Origin": ORIGIN})
+            assert response.status_code == 401
+            assert value not in response.text
+
+
+def test_unknown_endpoints_and_methods_use_private_error_envelope():
+    with TestClient(app, base_url=ORIGIN) as client:
+        missing = client.get("/api/v1/synthetic-missing-endpoint")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "NOT_FOUND"
+        assert missing.json()["error"]["request_id"] == missing.headers["X-Request-ID"]
+        method = client.delete("/health")
+        assert method.status_code == 405
+        assert method.json()["error"]["code"] == "METHOD_NOT_ALLOWED"
+
+
+@pytest.mark.parametrize("length,status", [("not-a-number", 400), ("-1", 413), ("1048577", 413)])
+def test_request_boundary_errors_keep_security_headers_and_correlation(length, status):
+    with TestClient(app, base_url=ORIGIN) as client:
+        response = client.get("/health", headers={"Content-Length": length})
+    assert response.status_code == status
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.json()["error"]["request_id"] == response.headers["X-Request-ID"]
+    assert "default-src 'none'" in response.headers["Content-Security-Policy"]

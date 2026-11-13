@@ -13,27 +13,34 @@ elif os.environ.get("KAJH_GATEWAY_MODE", "main") != "main":
 
 
 async def relay(reader, writer):
-    try:
-        while chunk := await reader.read(65536):
-            writer.write(chunk)
-            await writer.drain()
-    except (ConnectionError, asyncio.CancelledError):
-        pass
-    finally:
-        writer.close()
+    while chunk := await reader.read(65536):
+        writer.write(chunk)
+        await writer.drain()
+    # A client may finish its request with a TCP half-close and still expect
+    # the upstream response. Forward the FIN without closing the read side.
+    if writer.can_write_eof():
+        writer.write_eof()
+        await writer.drain()
 
 
 async def accept(reader, writer, target):
+    upstream_writer = None
+    tasks = []
     try:
         upstream_reader, upstream_writer = await asyncio.wait_for(asyncio.open_connection(*target), 5)
         tasks = [asyncio.create_task(relay(reader, upstream_writer)),
                  asyncio.create_task(relay(upstream_reader, writer))]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*done, *pending, return_exceptions=True)
+        await asyncio.gather(*tasks)
     except (OSError, asyncio.TimeoutError):
-        writer.close()
+        pass
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        writers = [writer] + ([upstream_writer] if upstream_writer is not None else [])
+        for stream in writers:
+            stream.close()
+        await asyncio.gather(*(stream.wait_closed() for stream in writers), return_exceptions=True)
 
 
 async def main():

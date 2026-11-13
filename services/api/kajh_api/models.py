@@ -2,12 +2,31 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, ForeignKeyConstraint, Integer, String, Text, UniqueConstraint, CheckConstraint
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
+from sqlalchemy.dialects.postgresql import JSONB as PGJSONB, UUID as PGUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
+
+
+def strict_json_equal(first: Any, second: Any) -> bool:
+    try:
+        return json.dumps(first, sort_keys=True, allow_nan=False) == json.dumps(second, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        # SQLAlchemy's unloaded-value sentinel is not a JSON document.
+        return first is second
+
+
+class JSONB(TypeDecorator[Any]):
+    """JSON equality must distinguish booleans from numbers, as PostgreSQL does."""
+    impl = PGJSONB
+    cache_ok = True
+
+    def compare_values(self, first: Any, second: Any) -> bool:
+        return strict_json_equal(first, second)
 
 
 def utcnow() -> datetime:
@@ -110,7 +129,7 @@ class SourcePermission(Scoped, Base):
 
 class Job(Scoped, Base):
     __tablename__ = "jobs"
-    __table_args__ = (UniqueConstraint("workspace_id", "id"), UniqueConstraint("workspace_id", "idempotency_key"), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), CheckConstraint("attempts >= 0 AND max_attempts BETWEEN 1 AND 10"), {"schema": "app"})
+    __table_args__ = (UniqueConstraint("workspace_id", "id"), UniqueConstraint("workspace_id", "source_id", "id", name="jobs_source_identity"), UniqueConstraint("workspace_id", "idempotency_key"), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), CheckConstraint("attempts >= 0 AND max_attempts BETWEEN 1 AND 10"), {"schema": "app"})
     source_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     kind: Mapped[str] = mapped_column(String(40), default="ingest")
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
@@ -130,7 +149,7 @@ class Job(Scoped, Base):
 
 class SourceRun(Scoped, Base):
     __tablename__ = "source_runs"
-    __table_args__ = (UniqueConstraint("workspace_id", "id"), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), ForeignKeyConstraint(["workspace_id", "job_id"], ["app.jobs.workspace_id", "app.jobs.id"]), {"schema": "app"})
+    __table_args__ = (UniqueConstraint("workspace_id", "id"), UniqueConstraint("workspace_id", "source_id", "id", name="source_runs_source_identity"), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), ForeignKeyConstraint(["workspace_id", "job_id"], ["app.jobs.workspace_id", "app.jobs.id"]), ForeignKeyConstraint(["workspace_id", "source_id", "job_id"], ["app.jobs.workspace_id", "app.jobs.source_id", "app.jobs.id"], name="source_runs_job_source_fk"), {"schema": "app"})
     source_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True))
     job_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="running")
@@ -144,7 +163,7 @@ class SourceRun(Scoped, Base):
 
 class RawObservation(Scoped, Base):
     __tablename__ = "raw_observations"
-    __table_args__ = (UniqueConstraint("workspace_id", "id"), UniqueConstraint("workspace_id", "source_id", "external_id", "payload_hash"), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), ForeignKeyConstraint(["workspace_id", "source_run_id"], ["app.source_runs.workspace_id", "app.source_runs.id"]), {"schema": "app"})
+    __table_args__ = (UniqueConstraint("workspace_id", "id"), UniqueConstraint("workspace_id", "source_id", "external_id", "id", name="raw_observations_source_identity"), UniqueConstraint("workspace_id", "source_id", "external_id", "payload_hash"), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), ForeignKeyConstraint(["workspace_id", "source_run_id"], ["app.source_runs.workspace_id", "app.source_runs.id"]), ForeignKeyConstraint(["workspace_id", "source_id", "source_run_id"], ["app.source_runs.workspace_id", "app.source_runs.source_id", "app.source_runs.id"], name="raw_observations_run_source_fk"), {"schema": "app"})
     source_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True))
     source_run_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True))
     external_id: Mapped[str] = mapped_column(String(200))
@@ -156,7 +175,7 @@ class RawObservation(Scoped, Base):
 
 class Opportunity(Scoped, Base):
     __tablename__ = "opportunities"
-    __table_args__ = (UniqueConstraint("workspace_id", "id"), CheckConstraint("eligibility IN ('Eligible','Ineligible','Unknown','Needs Review')"), {"schema": "app"})
+    __table_args__ = (UniqueConstraint("workspace_id", "id"), CheckConstraint("eligibility IN ('Eligible','Ineligible','Unknown','Needs Review')"), CheckConstraint("merged_into IS NULL OR merged_into <> id", name="opportunities_no_self_merge"), ForeignKeyConstraint(["workspace_id", "merged_into"], ["app.opportunities.workspace_id", "app.opportunities.id"], name="opportunities_merged_workspace_fk"), {"schema": "app"})
     title: Mapped[str] = mapped_column(String(300))
     organization: Mapped[str] = mapped_column(String(200))
     organization_domain: Mapped[str | None] = mapped_column(String(250), nullable=True)
@@ -178,7 +197,7 @@ class Opportunity(Scoped, Base):
 
 class OpportunitySource(Scoped, Base):
     __tablename__ = "opportunity_sources"
-    __table_args__ = (UniqueConstraint("workspace_id", "source_id", "external_id"), ForeignKeyConstraint(["workspace_id", "opportunity_id"], ["app.opportunities.workspace_id", "app.opportunities.id"]), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), ForeignKeyConstraint(["workspace_id", "observation_id"], ["app.raw_observations.workspace_id", "app.raw_observations.id"]), {"schema": "app"})
+    __table_args__ = (UniqueConstraint("workspace_id", "source_id", "external_id"), ForeignKeyConstraint(["workspace_id", "opportunity_id"], ["app.opportunities.workspace_id", "app.opportunities.id"]), ForeignKeyConstraint(["workspace_id", "source_id"], ["app.sources.workspace_id", "app.sources.id"]), ForeignKeyConstraint(["workspace_id", "observation_id"], ["app.raw_observations.workspace_id", "app.raw_observations.id"]), ForeignKeyConstraint(["workspace_id", "source_id", "external_id", "observation_id"], ["app.raw_observations.workspace_id", "app.raw_observations.source_id", "app.raw_observations.external_id", "app.raw_observations.id"], name="opportunity_sources_observation_identity_fk"), {"schema": "app"})
     opportunity_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True))
     source_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True))
     observation_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True))
