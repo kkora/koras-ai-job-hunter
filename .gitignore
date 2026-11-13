@@ -1,5 +1,7 @@
 .env
+.env.*
 .local/
+.claude/settings.local.json
 .venv/
 .cache/
 __pycache__/
@@ -16,3 +18,13 @@ test-results/
 playwright-report/
 *.log
 .DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.backup
+*.sql.gz
+.auth/
+storage-state*.json
+trace.zip
